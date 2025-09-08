@@ -18,43 +18,57 @@ const DEFAULT_CACHE_DIR = normpath("./cache")
 export WAMInterpolator, get_density, get_density_batch
 
 """
-    WAMInterpolator(; bucket="noaa-nws-wam-ipe-pds", product="wfs", varname="rho",
-                      region="us-east-1", interpolation=:nearest)
+    WAMInterpolator(; bucket="noaa-nws-wam-ipe-pds", product="wfs", varname="den",
+                      region="us-east-1", interpolation=:sciml)
 
-Create an interpolator for NOAA WAM-IPE S3 bucket list.
+Configuration object for accessing and interpolating WAM-IPE data on S3.
 
-- `bucket`: S3 bucket name (public)
-- `product`: subfolder prefix like `"wfs"` or `"wrs"`
-- `varname`: NetCDF variable name for neutral density (set to your target; defaults `"rho"`)
+- `bucket`: S3 bucket name (public). Default: `"noaa-nws-wam-ipe-pds"`.
+- `product::String` — Product subfolder prefix, typically `"wfs"` (forecast) or `"wrs"` (Real-time Nowcast).
+- `varname`: NetCDF variable name for neutral density (set to your target; defaults `"den"`)
 - `region`: AWS region (WAM-IPE public data is in `us-east-1`)
-- `interpolation`: `:nearest`, `:linear`, or `:logz_linear`
+- `interpolation`: `:nearest`, `:linear`, `:logz_linear`, `:logz_quadratic` or `:sciml`
 """
 Base.@kwdef struct WAMInterpolator
     bucket::String = "noaa-nws-wam-ipe-pds"
     root_prefix::String = "v1.2" # S3 root prefix for WAM-IPE data
     product::String = "wfs"
-    varname::String = "rho"
+    varname::String = "den"
     region::String = "us-east-1"
-    interpolation::Symbol = :nearest
+    interpolation::Symbol = :sciml
 end
 
 
 # Helpers 
 
-# Public bucket: configure unsigned / anonymous access
+"""
+    _aws_cfg(region) returns AWS.AWSConfig
+
+Create an unsigned AWS config for `region`.
+This avoids credential requirements for public WAM-IPE objects.
+"""
 function _aws_cfg(region::String)
     AWS.AWSConfig(; region=region, creds=nothing)
 end
+
+"""
+    _cache_path(cache_dir, key) returns String
+
+Joins `cache_dir` and S3 `key` using a normalised path while keeping the
+remote directory structure (e.g. `v1.2/wfs...`).
+"""
 
 _cache_path(cache_dir::AbstractString, key::AbstractString) =   
     normpath(joinpath(cache_dir, key))  # preserves v1.2/…/… structure
 
 """
-    _download_to_cache(aws, bucket, key; cache_dir=DEFAULT_CACHE_DIR, cache_max_bytes=2_000_000_000, verbose=true)
+    _download_to_cache(aws, bucket, key; cache_dir=DEFAULT_CACHE_DIR,
+                       cache_max_bytes=2_000_000_000, verbose=true) returns String
 
 Download `key` into an on-disk, thread-safe LRU cache rooted at `cache_dir`.
-Returns the local path (atomic and safe for concurrent use).
+Returns the local path, atomic and safe for concurrent use.
 """
+
 function _download_to_cache(aws::AWS.AWSConfig, bucket::String, key::String;
                             cache_dir::AbstractString=DEFAULT_CACHE_DIR,
                             cache_max_bytes::Int=2_000_000_000,
@@ -68,8 +82,9 @@ end
     _open_nc_from_s3(aws, bucket, key; cache_dir=DEFAULT_CACHE_DIR)
 
 Opens the NetCDF from local cache if present, otherwise downloads from S3 into cache.
-Returns `(ds, path)`; caller should `close(ds)` but NOT delete the file.
+Returns `(ds, path)`; Caller must `close(ds)` when done. The cache file is kept for reuse.
 """
+
 function _open_nc_from_s3(aws::AWS.AWSConfig, bucket::String, key::String;
                           cache_dir::AbstractString=DEFAULT_CACHE_DIR,
                           cache_max_bytes::Int=2_000_000_000)
@@ -79,6 +94,13 @@ function _open_nc_from_s3(aws::AWS.AWSConfig, bucket::String, key::String;
                                     verbose=true)
     return NCDataset(local_path, "r"), local_path
 end
+
+"""
+    print_cache_stats(; cache_dir=DEFAULT_CACHE_DIR, cache_max_bytes=2_000_000_000)
+
+Prints the current cache directory, capacity, usage, and LRU/MRU keys.
+Useful for debugging what is stored on disk.
+"""
 
 function print_cache_stats(; cache_dir::AbstractString=DEFAULT_CACHE_DIR, cache_max_bytes::Int=2_000_000_000)
     cache = _get_cache(cache_dir, cache_max_bytes)
@@ -99,7 +121,12 @@ const _VERSION_WINDOWS = (
     ("v1.1", DateTime(2023,3,20,21,10,0), DateTime(2023,6,30,21,0,0)), # inclusive start/ end
     ("v1.2", DateTime(2023,6,30,21,10,0), nothing), # open-ended
 )
+"""
+    _version_for(dt) returns String
 
+Returns the S3 version root (e.g. `"v1.2"`) that applies to `dt` based on
+internal date windows.
+"""
 function _version_for(dt::DateTime)::String
     for (v, lo, hi) in _VERSION_WINDOWS
         if dt >= lo && (hi === nothing || dt <= hi)
@@ -108,6 +135,13 @@ function _version_for(dt::DateTime)::String
     end
     error("No WAM-IPE version mapping covers $dt")
 end
+
+"""
+    _model_for_version(v) returns String
+
+Map a version root (e.g. `"v1.1"`, `"v1.2"`) to its model token used in filenames
+(e.g. `"wam10"`, `"gsm10"`).
+"""
 
 _model_for_version(v::String) = v == "v1.2" ? "wam10" :
                                 v == "v1.1" ? "gsm10" :
@@ -132,9 +166,22 @@ end
 # cache instances keyed by (dir, max_bytes)
 const _CACHES = Dict{Tuple{String,Int64}, _FileCache}()
 
+"""
+    _cache_meta_path(dir) returns String
+
+Returns the path of the cache metadata file in `dir`.
+"""
+
 function _cache_meta_path(dir::AbstractString)
     joinpath(dir, _CACHE_META_FILE)
 end
+
+"""
+    _load_cache(dir, max_bytes) returns _FileCache
+
+Load/initialises the on-disk cache metadata for `dir`. This is tolerant of
+corrupt/old metadata and recreates missing fields.
+"""
 
 function _load_cache(dir::AbstractString, max_bytes::Int64)
     mkpath(dir)
@@ -167,6 +214,12 @@ function _load_cache(dir::AbstractString, max_bytes::Int64)
     )
 end
 
+"""
+    _save_cache(cache) returns Nothing
+
+Persist cache metadata to disk.
+"""
+
 function _save_cache(cache::_FileCache)
     mkpath(cache.dir)
     open(_cache_meta_path(cache.dir), "w") do io
@@ -176,6 +229,12 @@ function _save_cache(cache::_FileCache)
 end
 
 # Mark a key as most recently used
+"""
+    _lru_touch!(cache, key)
+
+Mark `key` as most-recently-used in `cache`.
+"""
+
 function _lru_touch!(cache::_FileCache, key::String)
     # remove if present
     idx = findfirst(==(key), cache.order)
@@ -186,6 +245,13 @@ function _lru_touch!(cache::_FileCache, key::String)
 end
 
 # Evict least-recently used files until under budget
+
+"""
+    _evict_until_under_budget!(cache)
+
+Deletes least-recently-used files from disk until the cache fits within
+`cache.max_bytes`.
+"""
 function _evict_until_under_budget!(cache::_FileCache)
     while cache.bytes > cache.max_bytes && !isempty(cache.order)
         victim = first(cache.order)
@@ -206,6 +272,13 @@ function _evict_until_under_budget!(cache::_FileCache)
 end
 
 # main: return local path for (bucket,key), downloading if necessary
+"""
+    _cache_get_file!(cache, aws, bucket, key; verbose=true) returns String
+
+Core cache routine. If present, return the cached path. Otherwise download the
+object (AWSS3 stream with HTTP fallback), store it atomically, update LRU and
+size accounting, possibly evicting older files. Safe for concurrent threads.
+"""
 function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String, key::String;
                           verbose::Bool=true)
     local_path = normpath(joinpath(cache.dir, key))
@@ -316,6 +389,12 @@ function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String,
     end
 end
 
+"""
+    _get_cache(cache_dir, max_bytes) returns _FileCache
+
+Gets/creates the shared cache object for `(cache_dir, max_bytes)`.
+"""
+
 function _get_cache(cache_dir::AbstractString, max_bytes::Int64)
     key = (String(cache_dir), Int64(max_bytes))
     if haskey(_CACHES, key)
@@ -327,6 +406,13 @@ function _get_cache(cache_dir::AbstractString, max_bytes::Int64)
 end
 
 # Single file download attempt (no interpolation)
+"""
+    _try_download(itp, dt, product) returns Union{String,Nothing}
+
+Attempt to download a single NetCDF corresponding to an exact 10-minute
+stamp `dt` under `product` (e.g. `"wfs"`). Returns local path on success,
+`nothing` on failure.
+"""
 function _try_download(itp::WAMInterpolator, dt::DateTime, product::String)
     aws = _aws_cfg(itp.region)
     key = _construct_s3_key(dt, product)
@@ -338,6 +424,14 @@ function _try_download(itp::WAMInterpolator, dt::DateTime, product::String)
 end
 
 # Returns one of: :km, :m, :pressure, :index, :missing, :unknown
+"""
+    _classify_vertical_units(units_raw) returns Symbol
+
+Classify vertical coordinate, heuristically, units into one of
+`:km`, `:m`, `:pressure`, `:index`, `:missing`, or `:unknown`.
+Used to validate/convert altitude queries.
+"""
+
 function _classify_vertical_units(units_raw::AbstractString)
     s = lowercase(strip(String(units_raw)))
     isempty(s) && return :missing
@@ -367,7 +461,11 @@ function _classify_vertical_units(units_raw::AbstractString)
     return :unknown
 end
 
+"""
+    _datetime_floor_10min(dt) returns DateTime
 
+Floor `dt` to the nearest 10-minute boundary.
+"""
 
 #  Ten-minute bracketing 
 function _datetime_floor_10min(dt::DateTime)
@@ -388,6 +486,12 @@ _surrounding_10min(dt::DateTime) = (_datetime_floor_10min(dt),
 #   if dt < 21:00 → 12:00
 #   else          → 18:00
 
+"""
+    _wrs_archive(dt) returns DateTime
+
+Select the cycle hour for the WRS product that should contain `dt`.
+This controls which S3 folder (…/HH/) to search.
+"""
 function _wrs_archive(dt::DateTime)::DateTime
     h = hour(dt)
     if h < 3
@@ -409,6 +513,13 @@ end
 #   if dt < 15:00 → 12:00
 #   if dt < 21:00 → 18:00
 #   else          → next day 00:00
+"""
+    _wfs_archive(dt) returns DateTime
+
+Select the cycle hour for the WFS product that should contain `dt`.
+This controls which S3 folder (…/HH/) to search.
+"""
+
 function _wfs_archive(dt::DateTime)::DateTime
     h = hour(dt)
     if h < 3
@@ -425,6 +536,14 @@ function _wfs_archive(dt::DateTime)::DateTime
 end
 
 #  Exact S3 key construction 
+"""
+    _construct_s3_key(dt, product) returns String
+
+Build the exact S3 key for a given 10-minute stamp `dt` and `product`
+(`"wfs"` or `"wrs"`). The filename encodes `dt`, while the folder encodes the
+chosen cycle hour.
+"""
+
 function _construct_s3_key(dt::DateTime, product::String)::String
     v       = _version_for(dt)
     model   = _model_for_version(v)
@@ -445,6 +564,14 @@ end
 _product_fallback_order(product::String) = product == "wfs" ? ("wfs","wrs") : ("wrs","wfs")
 
 # Returns two local file paths for the bracketing stamps
+"""
+    _get_two_files_exact(itp, dt) returns (low_path, high_path, low_product, high_product)
+
+Resolve and fetch the two local files that bracket the 10-minute stamp `dt`.
+Prefers the configured product, but will fall back to the alternate product if
+necessary. Throws if either side cannot be found.
+"""
+
 function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     dt_lo, dt_hi = _surrounding_10min(dt)
     pref, alt = _product_fallback_order(itp.product)  # e.g., ("wfs","wrs")
