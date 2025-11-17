@@ -15,7 +15,7 @@ using Serialization
 
 const DEFAULT_CACHE_DIR = normpath("./cache")
 
-export WAMInterpolator, get_density, get_density_batch
+export WAMInterpolator, get_density, get_density_batch, get_density_at_point, get_density_trajectory
 
 """
     WAMInterpolator(; bucket="noaa-nws-wam-ipe-pds", product="wfs", varname="den",
@@ -1195,5 +1195,80 @@ function get_density_from_key(itp::WAMInterpolator, key::AbstractString,
         close(ds); isfile(tmp) && rm(tmp; force=true)
     end
 end
+
+"""
+    get_density_at_point(itp, dt, lat, lon, alt_m;
+                         angles_in_deg = false)
+
+Wrapper around `get_density` that works directly with altitude in metres and
+angles in either radians or degrees.
+
+Arguments
+---------
+- `itp::WAMInterpolator` : configuration object.
+- `dt::DateTime`         : physical time of the state (UTC).
+- `lat::Real`            : latitude (rad by default).
+- `lon::Real`            : longitude (rad by default).
+- `alt_m::Real`          : geometric altitude in metres.
+
+Keyword arguments
+-----------------
+- `angles_in_deg::Bool=false` : set to `true` if `lat`/`lon` are already in
+    degrees. Otherwise they are assumed to be in radians and converted.
+"""
+function get_density_at_point(itp::WAMInterpolator,
+                              dt::DateTime,
+                              lat::Real,
+                              lon::Real,
+                              alt_m::Real;
+                              angles_in_deg::Bool = false)
+
+    # Convert to degrees if coming from typical orbital libraries (radians)
+    lat_deg = angles_in_deg ? float(lat) : rad2deg(float(lat))
+    lon_deg = angles_in_deg ? float(lon) : rad2deg(float(lon))
+
+    # Altitude metres → kilometres
+    alt_km = float(alt_m) * 1e-3
+
+    return get_density(itp, dt, lat_deg, lon_deg, alt_km)
+end
+
+"""
+    get_density_at_point(itp, dt, lat, lon, alt_m;
+                         angles_in_deg = false)
+
+Wrapper around `get_density` that works directly with altitude in metres and
+angles in either radians or degrees.
+
+Arguments
+---------
+- `itp::WAMInterpolator` : configuration object.
+- `dt::DateTime`         : physical time of the state (UTC).
+- `lat::Real`            : latitude (rad by default).
+- `lon::Real`            : longitude (rad by default).
+- `alt_m::Real`          : geometric altitude in metres.
+
+Keyword arguments
+-----------------
+- `angles_in_deg::Bool=false` : set to `true` if `lat`/`lon` are already in
+    degrees. Otherwise they are assumed to be in radians and converted.
+"""
+function get_density_at_point(itp::WAMInterpolator,
+                              dt::DateTime,
+                              lat::Real,
+                              lon::Real,
+                              alt_m::Real;
+                              angles_in_deg::Bool = false)
+
+    # Convert to degrees if coming from typical orbital libraries (radians)
+    lat_deg = angles_in_deg ? float(lat) : rad2deg(float(lat))
+    lon_deg = angles_in_deg ? float(lon) : rad2deg(float(lon))
+
+    # Altitude metres → kilometres
+    alt_km = float(alt_m) * 1e-3
+
+    return get_density(itp, dt, lat_deg, lon_deg, alt_km)
+end
+
 
 end # module
