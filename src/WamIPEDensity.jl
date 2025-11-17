@@ -1233,42 +1233,52 @@ function get_density_at_point(itp::WAMInterpolator,
     return get_density(itp, dt, lat_deg, lon_deg, alt_km)
 end
 
-"""
-    get_density_at_point(itp, dt, lat, lon, alt_m;
-                         angles_in_deg = false)
 
-Wrapper around `get_density` that works directly with altitude in metres and
-angles in either radians or degrees.
+"""
+    get_density_trajectory(itp, dts, lats, lons, alts_m;
+                           angles_in_deg = false)
+
+Vectorised wrapper around `get_density` for a full trajectory.
 
 Arguments
 ---------
-- `itp::WAMInterpolator` : configuration object.
-- `dt::DateTime`         : physical time of the state (UTC).
-- `lat::Real`            : latitude (rad by default).
-- `lon::Real`            : longitude (rad by default).
-- `alt_m::Real`          : geometric altitude in metres.
+- `dts::AbstractVector{<:DateTime}` : time stamps along the trajectory.
+- `lats::AbstractVector`            : latitudes (rad by default).
+- `lons::AbstractVector`            : longitudes (rad by default).
+- `alts_m::AbstractVector`          : altitudes in metres.
 
 Keyword arguments
 -----------------
-- `angles_in_deg::Bool=false` : set to `true` if `lat`/`lon` are already in
-    degrees. Otherwise they are assumed to be in radians and converted.
+- `angles_in_deg::Bool=false` : set to `true` if `lats`/`lons` are already in
+    degrees; otherwise they are assumed to be in radians.
+
+Returns
+-------
+`Vector{Float64}` of neutral densities, same length as `dts`.
 """
-function get_density_at_point(itp::WAMInterpolator,
-                              dt::DateTime,
-                              lat::Real,
-                              lon::Real,
-                              alt_m::Real;
-                              angles_in_deg::Bool = false)
+function get_density_trajectory(itp::WAMInterpolator,
+                                dts::AbstractVector{<:DateTime},
+                                lats::AbstractVector,
+                                lons::AbstractVector,
+                                alts_m::AbstractVector;
+                                angles_in_deg::Bool = false)
 
-    # Convert to degrees if coming from typical orbital libraries (radians)
-    lat_deg = angles_in_deg ? float(lat) : rad2deg(float(lat))
-    lon_deg = angles_in_deg ? float(lon) : rad2deg(float(lon))
+    n = length(dts)
+    @assert length(lats)    == n "lats length must match dts"
+    @assert length(lons)    == n "lons length must match dts"
+    @assert length(alts_m)  == n "alts_m length must match dts"
 
-    # Altitude metres → kilometres
-    alt_km = float(alt_m) * 1e-3
+    # Copy into plain Float64 vectors
+    latv  = Float64.(lats)
+    lonv  = Float64.(lons)
+    altkm = Float64.(alts_m) .* 1e-3
 
-    return get_density(itp, dt, lat_deg, lon_deg, alt_km)
+    if !angles_in_deg
+        latv .= rad2deg.(latv)
+        lonv .= rad2deg.(lonv)
+    end
+
+    return get_density_batch(itp, dts, latv, lonv, altkm)
 end
-
 
 end # module
