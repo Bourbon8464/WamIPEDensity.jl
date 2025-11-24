@@ -563,6 +563,24 @@ end
 
 _product_fallback_order(product::String) = product == "wfs" ? ("wfs","wrs") : ("wrs","wfs")
 
+# Build a WRS key but forcing the archive (cycle) hour you want
+function _construct_wrs_key_with_cycle(dt::DateTime, arch::DateTime)::String
+    v     = _version_for(dt)
+    model = _model_for_version(v)
+
+    ymd_dir = Dates.format(Date(arch), dateformat"yyyymmdd")
+    HH_dir  = @sprintf("%02d", hour(arch))    # folder: .../<HH>/
+
+    ymd     = Dates.format(Date(dt), dateformat"yyyymmdd")
+    HMS     = Dates.format(Time(dt), dateformat"HHMMSS")
+    HHfile  = @sprintf("%02d", hour(arch))    # tHHz uses cycle hour
+
+    return @sprintf("%s/%s.%s/%s/wam_fixed_height.%s.t%sz.%s.%s_%s.nc",
+                    v, "wrs", ymd_dir, HH_dir,
+                    "wrs", HHfile, model, ymd, HMS)
+end
+
+
 # Returns two local file paths for the bracketing stamps
 """
     _get_two_files_exact(itp, dt) returns (low_path, high_path, low_product, high_product)
@@ -572,25 +590,81 @@ Prefers the configured product, but will fall back to the alternate product if
 necessary. Throws if either side cannot be found.
 """
 
+# function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
+#     dt_lo, dt_hi = _surrounding_10min(dt)
+#     pref, alt = _product_fallback_order(itp.product)  # e.g., ("wfs","wrs")
+
+#     #  lower bracket: prefer `pref`, fall back to `alt` 
+#     p_lo = _try_download(itp, dt_lo, pref)
+#     prod_lo = p_lo === nothing ? begin
+#         p = _try_download(itp, dt_lo, alt)
+#         p === nothing ? nothing : (p, alt)
+#     end : (p_lo, pref)
+
+#     # upper bracket: prefer `pref`, fall back to `alt` 
+#     p_hi = _try_download(itp, dt_hi, pref)
+#     prod_hi = p_hi === nothing ? begin
+#         p = _try_download(itp, dt_hi, alt)
+#         p === nothing ? nothing : (p, alt)
+#     end : (p_hi, pref)
+
+#     # Validate we got both
+#     if prod_lo === nothing || prod_hi === nothing
+#         missing_sides = String[]
+#         prod_lo === nothing && push!(missing_sides, "low @ $(dt_lo)")
+#         prod_hi === nothing && push!(missing_sides, "high @ $(dt_hi)")
+#         error("Could not fetch files for $(join(missing_sides, ", ")); tried products $(pref), $(alt).")
+#     end
+
+#     p_lo_path, prod_lo_used = prod_lo
+#     p_hi_path, prod_hi_used = prod_hi
+
+#     if prod_lo_used != prod_hi_used
+#         @info "[mix] Using mixed products: low=$(prod_lo_used), high=$(prod_hi_used)"
+#     end
+
+#     return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
+# end
+
+
 function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     dt_lo, dt_hi = _surrounding_10min(dt)
-    pref, alt = _product_fallback_order(itp.product)  # e.g., ("wfs","wrs")
+    pref, alt    = _product_fallback_order(itp.product)  # ("wfs","wrs") or ("wrs","wfs")
 
-    #  lower bracket: prefer `pref`, fall back to `alt` 
     p_lo = _try_download(itp, dt_lo, pref)
     prod_lo = p_lo === nothing ? begin
         p = _try_download(itp, dt_lo, alt)
         p === nothing ? nothing : (p, alt)
     end : (p_lo, pref)
 
-    # upper bracket: prefer `pref`, fall back to `alt` 
-    p_hi = _try_download(itp, dt_hi, pref)
-    prod_hi = p_hi === nothing ? begin
-        p = _try_download(itp, dt_hi, alt)
-        p === nothing ? nothing : (p, alt)
-    end : (p_hi, pref)
+    #  upper bracket: special handling for WRS before 03:00 UTC 
+    if itp.product == "wrs" && hour(dt) < 3
+        # we want: low from 18Z previous day, high from 00Z same day
+        arch_lo = _wrs_archive(dt_lo)                                  
+        arch_hi = DateTime(Date(dt), Time(0))                   
 
-    # Validate we got both
+        aws = _aws_cfg(itp.region)
+        key_lo = _construct_wrs_key_with_cycle(dt_lo, arch_lo)
+        key_hi = _construct_wrs_key_with_cycle(dt_hi, arch_hi)
+
+        local_lo = _download_to_cache(aws, itp.bucket, key_lo;
+                                      cache_dir=DEFAULT_CACHE_DIR,
+                                      verbose=true)
+        local_hi = _download_to_cache(aws, itp.bucket, key_hi;
+                                      cache_dir=DEFAULT_CACHE_DIR,
+                                      verbose=true)
+
+        prod_lo = (local_lo, "wrs")
+        prod_hi = (local_hi, "wrs")
+    else
+        p_hi = _try_download(itp, dt_hi, pref)
+        prod_hi = p_hi === nothing ? begin
+            p = _try_download(itp, dt_hi, alt)
+            p === nothing ? nothing : (p, alt)
+        end : (p_hi, pref)
+    end
+
+    #  sanity checks 
     if prod_lo === nothing || prod_hi === nothing
         missing_sides = String[]
         prod_lo === nothing && push!(missing_sides, "low @ $(dt_lo)")
@@ -1204,7 +1278,7 @@ Wrapper around `get_density` that works directly with altitude in metres and
 angles in either radians or degrees.
 
 Arguments
----------
+
 - `itp::WAMInterpolator` : configuration object.
 - `dt::DateTime`         : physical time of the state (UTC).
 - `lat::Real`            : latitude (rad by default).
@@ -1212,7 +1286,7 @@ Arguments
 - `alt_m::Real`          : geometric altitude in metres.
 
 Keyword arguments
------------------
+--
 - `angles_in_deg::Bool=false` : set to `true` if `lat`/`lon` are already in
     degrees. Otherwise they are assumed to be in radians and converted.
 """
@@ -1241,19 +1315,19 @@ end
 Vectorised wrapper around `get_density` for a full trajectory.
 
 Arguments
----------
+
 - `dts::AbstractVector{<:DateTime}` : time stamps along the trajectory.
 - `lats::AbstractVector`            : latitudes (rad by default).
 - `lons::AbstractVector`            : longitudes (rad by default).
 - `alts_m::AbstractVector`          : altitudes in metres.
 
 Keyword arguments
------------------
+--
 - `angles_in_deg::Bool=false` : set to `true` if `lats`/`lons` are already in
     degrees; otherwise they are assumed to be in radians.
 
 Returns
--------
+-
 `Vector{Float64}` of neutral densities, same length as `dts`.
 """
 function get_density_trajectory(itp::WAMInterpolator,
