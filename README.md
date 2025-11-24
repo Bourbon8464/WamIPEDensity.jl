@@ -16,7 +16,7 @@ Developed as part of the [SpaceAGORA project](https://github.com/Space-FALCON-La
 - [ ] Figure out how to integrate this within SpaceAGORA 
 - [x] Finish writing up Docstrings for Julia to understand
 - [x] Create documentation using `documntation.jl`
-- [ ] Register package in Julia General registry.
+- [x] Register package in Julia General registry.
 - [x] Provide umbrella package `WamIPE.jl` (live + forecast).
 
 ---
@@ -132,4 +132,5 @@ for (ti, val) in zip(dt_array, densities)
 end
 
 ```
+
 
