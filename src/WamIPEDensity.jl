@@ -13,7 +13,7 @@ using URIs
 using DataInterpolations
 using Serialization
 
-const DEFAULT_CACHE_DIR = normpath("./cache")
+const DEFAULT_CACHE_DIR = abspath(joinpath(@__DIR__, "..", "cache")) # const DEFAULT_CACHE_DIR = normpath("./cache")
 
 export WAMInterpolator, get_density, get_density_batch, get_density_at_point, get_density_trajectory
 
