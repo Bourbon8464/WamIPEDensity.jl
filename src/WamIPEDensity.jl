@@ -631,40 +631,61 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     dt_lo, dt_hi = _surrounding_10min(dt)
     pref, alt    = _product_fallback_order(itp.product)  # ("wfs","wrs") or ("wrs","wfs")
 
+    if itp.product == "wrs"
+        h = hour(dt)
+
+        # Case A: 00:00–02:59 UTC
+        # Bridge the gap: low from previous day's 18Z cycle, high from today's 00Z cycle.
+        if h < 3
+            arch_lo = _wrs_archive(dt_lo)                      # will be previous day 18Z
+            arch_hi = DateTime(Date(dt), Time(0))              # force today's 00Z
+
+            aws = _aws_cfg(itp.region)
+            key_lo = _construct_wrs_key_with_cycle(dt_lo, arch_lo)
+            key_hi = _construct_wrs_key_with_cycle(dt_hi, arch_hi)
+
+            local_lo = _download_to_cache(aws, itp.bucket, key_lo;
+                                          cache_dir=DEFAULT_CACHE_DIR, verbose=true)
+            local_hi = _download_to_cache(aws, itp.bucket, key_hi;
+                                          cache_dir=DEFAULT_CACHE_DIR, verbose=true)
+
+            return (local_lo, local_hi, "wrs", "wrs")
+        end
+
+        # Case B: 03:00–08:59 UTC
+        # As soon as we reach "morning", lock both files to the new day's 00Z folder.
+        if h < 9
+            aws = _aws_cfg(itp.region)
+            arch = DateTime(Date(dt), Time(0))                 # force today's 00Z for BOTH brackets
+
+            key_lo = _construct_wrs_key_with_cycle(dt_lo, arch)
+            key_hi = _construct_wrs_key_with_cycle(dt_hi, arch)
+
+            local_lo = _download_to_cache(aws, itp.bucket, key_lo;
+                                          cache_dir=DEFAULT_CACHE_DIR, verbose=true)
+            local_hi = _download_to_cache(aws, itp.bucket, key_hi;
+                                          cache_dir=DEFAULT_CACHE_DIR, verbose=true)
+
+            return (local_lo, local_hi, "wrs", "wrs")
+        end
+
+        # Case C: 09:00–14:59 → use 06Z cycle; 15:00–20:59 → 12Z; ≥21:00 → 18Z (standard rule)
+        # For these hours we’ll use the default exact-key logic but *only within WRS* first,
+        # falling back to WFS if truly missing.
+        # fall through to the generic path below
+    end
     p_lo = _try_download(itp, dt_lo, pref)
     prod_lo = p_lo === nothing ? begin
         p = _try_download(itp, dt_lo, alt)
         p === nothing ? nothing : (p, alt)
     end : (p_lo, pref)
+xw
+    p_hi = _try_download(itp, dt_hi, pref)
+    prod_hi = p_hi === nothing ? begin
+        p = _try_download(itp, dt_hi, alt)
+        p === nothing ? nothing : (p, alt)
+    end : (p_hi, pref)
 
-    #  upper bracket: special handling for WRS before 03:00 UTC 
-    if itp.product == "wrs" && hour(dt) < 3
-        # we want: low from 18Z previous day, high from 00Z same day
-        arch_lo = _wrs_archive(dt_lo)                                  
-        arch_hi = DateTime(Date(dt), Time(0))                   
-
-        aws = _aws_cfg(itp.region)
-        key_lo = _construct_wrs_key_with_cycle(dt_lo, arch_lo)
-        key_hi = _construct_wrs_key_with_cycle(dt_hi, arch_hi)
-
-        local_lo = _download_to_cache(aws, itp.bucket, key_lo;
-                                      cache_dir=DEFAULT_CACHE_DIR,
-                                      verbose=true)
-        local_hi = _download_to_cache(aws, itp.bucket, key_hi;
-                                      cache_dir=DEFAULT_CACHE_DIR,
-                                      verbose=true)
-
-        prod_lo = (local_lo, "wrs")
-        prod_hi = (local_hi, "wrs")
-    else
-        p_hi = _try_download(itp, dt_hi, pref)
-        prod_hi = p_hi === nothing ? begin
-            p = _try_download(itp, dt_hi, alt)
-            p === nothing ? nothing : (p, alt)
-        end : (p_hi, pref)
-    end
-
-    #  sanity checks 
     if prod_lo === nothing || prod_hi === nothing
         missing_sides = String[]
         prod_lo === nothing && push!(missing_sides, "low @ $(dt_lo)")
@@ -674,13 +695,12 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
 
     p_lo_path, prod_lo_used = prod_lo
     p_hi_path, prod_hi_used = prod_hi
-
     if prod_lo_used != prod_hi_used
         @info "[mix] Using mixed products: low=$(prod_lo_used), high=$(prod_hi_used)"
     end
-
     return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
 end
+
 
 #  Time utilities 
 function _decode_time_units(ds::NCDataset, tname::String, t::AbstractVector)
