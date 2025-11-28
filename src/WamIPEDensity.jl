@@ -626,60 +626,56 @@ necessary. Throws if either side cannot be found.
 #     return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
 # end
 
+const _WRS_00Z_FIRST_TIME = Time(3, 10, 0)  # first valid file under 00Z folder is ..._031000.nc
 
 function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     dt_lo, dt_hi = _surrounding_10min(dt)
     pref, alt    = _product_fallback_order(itp.product)  # ("wfs","wrs") or ("wrs","wfs")
 
     if itp.product == "wrs"
-        h = hour(dt)
+        # The first valid timestamp available in today's 00Z folder
+        first_00z_dt = DateTime(Date(dt), _WRS_00Z_FIRST_TIME)
 
-        # Case A: 00:00–02:59 UTC
-        # Bridge the gap: low from previous day's 18Z cycle, high from today's 00Z cycle.
-        if h < 3
-            arch_lo = _wrs_archive(dt_lo)                      # will be previous day 18Z
-            arch_hi = DateTime(Date(dt), Time(0))              # force today's 00Z
-
+        # Helper to pull a single file from a chosen cycle
+        function get_from_cycle(dt_file::DateTime, arch::DateTime)
             aws = _aws_cfg(itp.region)
-            key_lo = _construct_wrs_key_with_cycle(dt_lo, arch_lo)
-            key_hi = _construct_wrs_key_with_cycle(dt_hi, arch_hi)
-
-            local_lo = _download_to_cache(aws, itp.bucket, key_lo;
-                                          cache_dir=DEFAULT_CACHE_DIR, verbose=true)
-            local_hi = _download_to_cache(aws, itp.bucket, key_hi;
-                                          cache_dir=DEFAULT_CACHE_DIR, verbose=true)
-
-            return (local_lo, local_hi, "wrs", "wrs")
+            key = _construct_wrs_key_with_cycle(dt_file, arch)
+            return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=true)
         end
 
-        # Case B: 03:00–08:59 UTC
-        # As soon as we reach "morning", lock both files to the new day's 00Z folder.
-        if h < 9
-            aws = _aws_cfg(itp.region)
-            arch = DateTime(Date(dt), Time(0))                 # force today's 00Z for BOTH brackets
+        # Cycle anchors we may force
+        arch_prev18 = DateTime(Date(dt) - Day(1), Time(18))  # previous day's 18Z
+        arch_today00 = DateTime(Date(dt), Time(0))           # today's 00Z
 
-            key_lo = _construct_wrs_key_with_cycle(dt_lo, arch)
-            key_hi = _construct_wrs_key_with_cycle(dt_hi, arch)
+        if dt_hi < first_00z_dt
+            # Case 1: Entire bracket before 03:10 → both from previous day's 18Z
+            local_lo = get_from_cycle(dt_lo, arch_prev18)
+            local_hi = get_from_cycle(dt_hi, arch_prev18)
+            return (local_lo, local_hi, "wrs", "wrs")
 
-            local_lo = _download_to_cache(aws, itp.bucket, key_lo;
-                                          cache_dir=DEFAULT_CACHE_DIR, verbose=true)
-            local_hi = _download_to_cache(aws, itp.bucket, key_hi;
-                                          cache_dir=DEFAULT_CACHE_DIR, verbose=true)
+        elseif dt_lo < first_00z_dt <= dt_hi
+            # Case 2: Bracket straddles 03:10
+            # - low from previous day's 18Z at dt_lo
+            # - high from today's 00Z, BUT clamp to at least 03:10 so we never request nonexistent stamps
+            clamped_hi = max(dt_hi, first_00z_dt)
+            local_lo = get_from_cycle(dt_lo, arch_prev18)
+            local_hi = get_from_cycle(clamped_hi, arch_today00)
+            return (local_lo, local_hi, "wrs", "wrs")
 
+        else
+            # Case 3: At/after 03:10 → both from today's 00Z
+            local_lo = get_from_cycle(dt_lo, arch_today00)
+            local_hi = get_from_cycle(dt_hi, arch_today00)
             return (local_lo, local_hi, "wrs", "wrs")
         end
-
-        # Case C: 09:00–14:59 → use 06Z cycle; 15:00–20:59 → 12Z; ≥21:00 → 18Z (standard rule)
-        # For these hours we’ll use the default exact-key logic but *only within WRS* first,
-        # falling back to WFS if truly missing.
-        # fall through to the generic path below
     end
+
     p_lo = _try_download(itp, dt_lo, pref)
     prod_lo = p_lo === nothing ? begin
         p = _try_download(itp, dt_lo, alt)
         p === nothing ? nothing : (p, alt)
     end : (p_lo, pref)
-xw
+
     p_hi = _try_download(itp, dt_hi, pref)
     prod_hi = p_hi === nothing ? begin
         p = _try_download(itp, dt_hi, alt)
