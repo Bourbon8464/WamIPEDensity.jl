@@ -13,7 +13,7 @@ using URIs
 using DataInterpolations
 using Serialization
 
-const DEFAULT_CACHE_DIR = normpath("./cache")
+const DEFAULT_CACHE_DIR = abspath(joinpath(@__DIR__, "..", "cache")) # const DEFAULT_CACHE_DIR = normpath("./cache")
 
 export WAMInterpolator, get_density, get_density_batch, get_density_at_point, get_density_trajectory
 
@@ -670,18 +670,20 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
         p_hi_path, prod_hi_used = _resolve_wrs_stamp(dt_hi)
 
         # Hard error if either side is missing, with clear guidance
-    if p_lo_path === nothing || p_hi_path === nothing
-        missing = String[]
-        if p_lo_path === nothing
-            push!(missing, "low @ $(dt_lo) (tried wrs.$(Dates.format(Date(dt_lo), dateformat"yyyymmdd"))/00 then previous day /18)")
+       if p_lo_path === nothing || p_hi_path === nothing
+            missing = String[]
+            if p_lo_path === nothing
+                push!(missing, "low @ $(dt_lo) (tried wrs.$(Dates.format(Date(dt_lo), dateformat"yyyymmdd"))/00 then previous day /18)")
+            end
+            if p_hi_path === nothing
+                push!(missing, "high @ $(dt_hi) (tried wrs.$(Dates.format(Date(dt_hi), dateformat"yyyymmdd"))/00 then previous day /18)")
+            end
+            error("Could not fetch WRS files for $(join(missing, "; ")). " *
+                "This usually means the earliest same-day 00Z products begin later (e.g., ~03:10) " *
+                "and the previous 18Z cycle also does not contain that valid stamp.")
         end
-        if p_hi_path === nothing
-            push!(missing, "high @ $(dt_hi) (tried wrs.$(Dates.format(Date(dt_hi), dateformat"yyyymmdd"))/00 then previous day /18)")
-        end
-        error("Could not fetch WRS files for $(join(missing, "; ")). " *
-            "This usually means the earliest same-day 00Z products begin later (e.g., ~03:10) " *
-            "and the previous 18Z cycle also does not contain that valid stamp.")
-    end
+
+
         return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
     end
 
@@ -708,6 +710,29 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     p_hi_path, prod_hi_used = prod_hi
     return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
 end
+
+
+
+#  Time utilities 
+function _decode_time_units(ds::NCDataset, tname::String, t::AbstractVector)
+    units = get(ds[tname].attrib, "units", "")
+    m = match(r"(seconds|minutes|hours|days) since (\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2}))?", units)
+    if m === nothing
+        return t, nothing, nothing  # keep DateTime axis as is
+    end
+    scale = m.captures[1]
+    epoch_date = Date(m.captures[2])
+    epoch_time = m.captures[3] === nothing ? Time(0) : Time(m.captures[3])
+    epoch = DateTime(epoch_date, epoch_time)
+
+    if eltype(t) <: DateTime
+        tnum = [ _encode_query_time(tt, epoch, scale) for tt in t ]
+        return tnum, epoch, scale
+    else
+        return collect(t), epoch, scale
+    end
+end
+
 
 # Convert query DateTime into the numeric coordinate used in the file
 function _encode_query_time(dtq::DateTime,
