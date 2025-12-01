@@ -678,8 +678,8 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
             if p_hi_path === nothing
                 push!(missing, "high @ $(dt_hi) (tried 00Z then 18Z)")
             end
-            error("Could not fetch WRS files for $(join(missing, "; ")). " *
-                  "Confirm the stamp exists under wrs.$(Dates.format(Date(dt_lo), dateformat\"yyyymmdd\"))/00 or the previous day's /18.")
+            error("Could not fetch WRS files for $(join(missing, '; ')). " *
+            "Confirm the stamp exists under wrs.$stamp/00 or the previous day's /18.")
         end
 
         if prod_lo_used != prod_hi_used
