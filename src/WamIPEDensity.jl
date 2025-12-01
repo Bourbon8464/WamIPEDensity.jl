@@ -635,8 +635,9 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     if itp.product == "wrs"
         aws = _aws_cfg(itp.region)
 
-        # helpers to force a WRS key into a specific cycle folder
-        get_from_cycle = function(dt_file::DateTime, arch::DateTime)
+        # Try to download a specific dt_file from a forced WRS archive (cycle) hour.
+        # Returns String local-path on success, or nothing.
+        function _try_wrs_from_cycle(dt_file::DateTime, arch::DateTime)
             key = _construct_wrs_key_with_cycle(dt_file, arch)
             try
                 return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=true)
@@ -645,45 +646,41 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
             end
         end
 
-        # For a given dt_file, try today's 00Z first, then yesterday's 18Z
-        function resolve_wrs(dt_file::DateTime)
-            arch_today00 = DateTime(Date(dt_file), Time(0))
-            arch_prev18  = DateTime(Date(dt_file) - Day(1), Time(18))
+        # For a given 10-min valid time, prefer SAME-DAY 00Z folder, else PREV-DAY 18Z folder.
+        # Returns (local_path::String, "wrs") or (nothing, "wrs")
+        function _resolve_wrs_stamp(dt_file::DateTime)
+            arch_00 = DateTime(Date(dt_file), Time(0))               # same day, 00Z
+            arch_18 = DateTime(Date(dt_file) - Day(1), Time(18))     # previous day, 18Z
 
-            # 1) Try next-day 00Z folder (wrs.YYYYMMDD/00/)
-            local00 = get_from_cycle(dt_file, arch_today00)
-            if local00 !== nothing
-                return (local00, "wrs")
+            # 1) Prefer 00Z (some days start around 03:10; if absent, this is nothing)
+            if (p00 = _try_wrs_from_cycle(dt_file, arch_00)) !== nothing
+                return (p00, "wrs")
             end
 
-            # 2) Fall back to previous-day 18Z folder (wrs.YYYYMMDD/18/)
-            local18 = get_from_cycle(dt_file, arch_prev18)
-            if local18 !== nothing
-                return (local18, "wrs")
+            # 2) Fall back to previous day's 18Z
+            if (p18 = _try_wrs_from_cycle(dt_file, arch_18)) !== nothing
+                return (p18, "wrs")
             end
 
             return (nothing, "wrs")
         end
 
-        # Resolve both sides independently with the 00Z→18Z preference
-        p_lo_path, prod_lo_used = resolve_wrs(dt_lo)
-        p_hi_path, prod_hi_used = resolve_wrs(dt_hi)
+        # Resolve both bracketing stamps independently with the 00Z→18Z preference
+        p_lo_path, prod_lo_used = _resolve_wrs_stamp(dt_lo)
+        p_hi_path, prod_hi_used = _resolve_wrs_stamp(dt_hi)
 
-        # Hard error with actionable detail if anything is missing
+        # Hard error if either side is missing, with clear guidance
         if p_lo_path === nothing || p_hi_path === nothing
             missing = String[]
             if p_lo_path === nothing
-                push!(missing, "low @ $(dt_lo) (tried 00Z then 18Z)")
+                push!(missing, "low @ $(dt_lo) (tried wrs.$(Dates.format(Date(dt_lo), dateformat"yyyymmdd"))/00 then previous day /18)")
             end
             if p_hi_path === nothing
-                push!(missing, "high @ $(dt_hi) (tried 00Z then 18Z)")
+                push!(missing, "high @ $(dt_hi) (tried wrs.$(Dates.format(Date(dt_hi), dateformat"yyyymmdd"))/00 then previous day /18)")
             end
-            error("Could not fetch WRS files for $(join(missing, '; ')). " *
-            "Confirm the stamp exists under wrs.$stamp/00 or the previous day's /18.")
-        end
-
-        if prod_lo_used != prod_hi_used
-            @info "[mix] Using mixed cycles: low from $(prod_lo_used), high from $(prod_hi_used)"
+            error("Could not fetch WRS files for $(join(missing, "; ")). " *
+                  "This usually means the earliest same-day 00Z products begin later (e.g., ~03:10) " *
+                  "and the previous 18Z cycle also does not contain that valid stamp.")
         end
 
         return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
@@ -710,12 +707,8 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
 
     p_lo_path, prod_lo_used = prod_lo
     p_hi_path, prod_hi_used = prod_hi
-    if prod_lo_used != prod_hi_used
-        @info "[mix] Using mixed products: low=$(prod_lo_used), high=$(prod_hi_used)"
-    end
     return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
 end
-
 
 # Convert query DateTime into the numeric coordinate used in the file
 function _encode_query_time(dtq::DateTime,
