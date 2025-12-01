@@ -670,19 +670,18 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
         p_hi_path, prod_hi_used = _resolve_wrs_stamp(dt_hi)
 
         # Hard error if either side is missing, with clear guidance
-        if p_lo_path === nothing || p_hi_path === nothing
-            missing = String[]
-            if p_lo_path === nothing
-                push!(missing, "low @ $(dt_lo) (tried wrs.$(Dates.format(Date(dt_lo), dateformat"yyyymmdd"))/00 then previous day /18)")
-            end
-            if p_hi_path === nothing
-                push!(missing, "high @ $(dt_hi) (tried wrs.$(Dates.format(Date(dt_hi), dateformat"yyyymmdd"))/00 then previous day /18)")
-            end
-            error("Could not fetch WRS files for $(join(missing, "; ")). " *
-                  "This usually means the earliest same-day 00Z products begin later (e.g., ~03:10) " *
-                  "and the previous 18Z cycle also does not contain that valid stamp.")
+    if p_lo_path === nothing || p_hi_path === nothing
+        missing = String[]
+        if p_lo_path === nothing
+            push!(missing, "low @ $(dt_lo) (tried wrs.$(Dates.format(Date(dt_lo), dateformat"yyyymmdd"))/00 then previous day /18)")
         end
-
+        if p_hi_path === nothing
+            push!(missing, "high @ $(dt_hi) (tried wrs.$(Dates.format(Date(dt_hi), dateformat"yyyymmdd"))/00 then previous day /18)")
+        end
+        error("Could not fetch WRS files for $(join(missing, "; ")). " *
+            "This usually means the earliest same-day 00Z products begin later (e.g., ~03:10) " *
+            "and the previous 18Z cycle also does not contain that valid stamp.")
+    end
         return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
     end
 
