@@ -1102,7 +1102,7 @@ function _maybe_convert_alt(z::AbstractVector, alt_km::Real, ds::NCDataset, znam
     kind  = _classify_vertical_units(units)
 
     if kind === :km
-        return alt_km©
+        return alt_km
     elseif kind === :m
         return alt_km * 1000
     elseif kind === :pressure
@@ -1658,7 +1658,7 @@ function get_density_trajectory(itp::WAMInterpolator,
     if !angles_in_deg
         latv .= rad2deg.(latv)
         lonv .= rad2deg.(lonv)
-    endƒ√
+    end
 
     return get_density_batch(itp, dts, latv, lonv, altkm)
 end
