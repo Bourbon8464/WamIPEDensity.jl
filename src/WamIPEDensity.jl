@@ -545,12 +545,19 @@ stamp `dt` under `product` (e.g. `"wfs"`). Returns local path on success,
 function _try_download(itp::WAMInterpolator, dt::DateTime, product::String)
     aws = _aws_cfg(itp.region)
     key = _construct_s3_key(dt, product)
+
+    # NEW: short-circuit if already cached on disk
+    if _have_in_cache(key)
+        return normpath(joinpath(DEFAULT_CACHE_DIR, key))
+    end
+
     try
         return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=false)
     catch
         return nothing
     end
 end
+
 
 # Returns one of: :km, :m, :pressure, :index, :missing, :unknown
 """
