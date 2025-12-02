@@ -220,7 +220,7 @@ function _open_nc_from_s3(aws::AWS.AWSConfig, bucket::String, key::String;
     local_path = _download_to_cache(aws, bucket, key;
                                     cache_dir=cache_dir,
                                     cache_max_bytes=cache_max_bytes,
-                                    verbose=true)
+                                    verbose=false)
     return NCDataset(local_path, "r"), local_path
 end
 
@@ -409,7 +409,7 @@ object (AWSS3 stream with HTTP fallback), store it atomically, update LRU and
 size accounting, possibly evicting older files. Safe for concurrent threads.
 """
 function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String, key::String;
-                          verbose::Bool=true)
+                          verbose::Bool=false)
     local_path = normpath(joinpath(cache.dir, key))
 
     # fast path: already on disk and recorded
@@ -546,7 +546,7 @@ function _try_download(itp::WAMInterpolator, dt::DateTime, product::String)
     aws = _aws_cfg(itp.region)
     key = _construct_s3_key(dt, product)
     try
-        return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=true)
+        return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=false)
     catch
         return nothing
     end
@@ -769,7 +769,7 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
         function _try_wrs_from_cycle(dt_file::DateTime, arch::DateTime)
             key = _construct_wrs_key_with_cycle(dt_file, arch)
             try
-                return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=true)
+                return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=false)
             catch
                 return nothing
             end
@@ -1520,7 +1520,7 @@ function get_density_from_key(itp::WAMInterpolator, key::AbstractString,
 
     # Ensure the file is present in on-disk cache; get local path
     aws = _aws_cfg(itp.region)
-    local_path = _download_to_cache(aws, itp.bucket, String(key); cache_dir=DEFAULT_CACHE_DIR, verbose=true)
+    local_path = _download_to_cache(aws, itp.bucket, String(key); cache_dir=DEFAULT_CACHE_DIR, verbose=false)
 
     # Open via pooled handles and unpin after
     ds = _open_nc_cached(local_path)
