@@ -1429,7 +1429,7 @@ function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real,
 
     # 1) Find local cached file paths (does S3 download if missing)
     p_lo, p_hi, prod_lo, prod_hi = _get_two_files_exact(itp, dt)
-    @info "[fetch] Using files: low=[$(prod_lo)] $(basename(p_lo)), high=[$(prod_hi)] $(basename(p_hi))"
+    @debug "[fetch] Using files: low=[$(prod_lo)] $(basename(p_lo)), high=[$(prod_hi)] $(basename(p_hi))"
 
     # 2) Open via pooled handles (pin); do NOT close—just unpin in finally
     ds_lo = _open_nc_cached(p_lo)
