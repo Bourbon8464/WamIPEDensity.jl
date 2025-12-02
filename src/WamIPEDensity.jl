@@ -15,6 +15,8 @@ using Serialization
 using CommonDataModel
 
 const DEFAULT_CACHE_DIR = normpath("./cache") # DEFAULT_CACHE_DIR = abspath(joinpath(@__DIR__, "..", "cache")) //Tarun
+const _FILEPAIR_CACHE = Dict{Tuple{String,DateTime}, Tuple{String,String,String,String}}()
+const _FILEPAIR_LOCK  = ReentrantLock()
 
 export WAMInterpolator, get_density, get_density_batch, get_density_at_point, get_density_trajectory
 
@@ -40,6 +42,18 @@ Base.@kwdef struct WAMInterpolator
 end
 
 # Helpers 
+function _cache_filepair!(product::String, dt::DateTime,
+                          p_lo::String, p_hi::String, prod_lo::String, prod_hi::String)
+    lock(_FILEPAIR_LOCK) do
+        _FILEPAIR_CACHE[(product, _datetime_floor_10min(dt))] = (p_lo, p_hi, prod_lo, prod_hi)
+    end
+end
+
+function _get_cached_filepair(product::String, dt::DateTime)
+    lock(_FILEPAIR_LOCK) do
+        get(_FILEPAIR_CACHE, (product, _datetime_floor_10min(dt)), nothing)
+    end
+end
 
 # CF-compliant decode (scale_factor/add_offset + fill to NaN) for any CDM variable
 function _cf_decode!(A::AbstractArray, var)
@@ -768,80 +782,77 @@ _have_in_cache(key::AbstractString; cache_dir::AbstractString=DEFAULT_CACHE_DIR)
 
 function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     dt_lo, dt_hi = _surrounding_10min(dt)
-    pref, alt    = _product_fallback_order(itp.product)  # ("wfs","wrs") or ("wrs","wfs")
+    pref, alt    = _product_fallback_order(itp.product)  # e.g., ("wfs","wrs") or ("wrs","wfs")
 
     if itp.product == "wrs"
         aws = _aws_cfg(itp.region)
 
-        # Try to download a specific dt_file from a forced WRS archive (cycle) hour.
-        # Returns String local-path on success, or nothing.
-        function _try_wrs_from_cycle(dt_file::DateTime, arch::DateTime)
-            key = _construct_wrs_key_with_cycle(dt_file, arch)
-
-            # Short-circuit if already cached on disk
-            if _have_in_cache(key)
-                return normpath(joinpath(DEFAULT_CACHE_DIR, key))
+        # Try a specific WRS archive (cycle) hour, but short-circuit to disk if already cached.
+        local function _try_wrs_from_cycle(dt_file::DateTime, arch::DateTime)
+            key        = _construct_wrs_key_with_cycle(dt_file, arch)
+            local_path = normpath(joinpath(DEFAULT_CACHE_DIR, key))
+            if isfile(local_path)
+                return local_path
             end
-
-            # Otherwise download into cache
             try
                 return _download_to_cache(aws, itp.bucket, key;
-                                        cache_dir=DEFAULT_CACHE_DIR, verbose=false)
+                                          cache_dir=DEFAULT_CACHE_DIR, verbose=false)
             catch
                 return nothing
             end
         end
 
-        # For a given 10-min valid time, prefer SAME-DAY 00Z folder, else PREV-DAY 18Z folder.
-        # Returns (local_path::String, "wrs") or (nothing, "wrs")
-        function _resolve_wrs_stamp(dt_file::DateTime)
-            arch_00 = DateTime(Date(dt_file), Time(0))               # same day, 00Z
-            arch_18 = DateTime(Date(dt_file) - Day(1), Time(18))     # previous day, 18Z
-
-            # 1) Prefer 00Z (some days start around 03:10; if absent, this is nothing)
+        # Prefer SAME-DAY 00Z folder; if missing, fall back to PREV-DAY 18Z.
+        local function _resolve_wrs_stamp(dt_file::DateTime)
+            arch_00 = DateTime(Date(dt_file), Time(0))               # same day 00Z
+            arch_18 = DateTime(Date(dt_file) - Day(1), Time(18))     # previous day 18Z
             if (p00 = _try_wrs_from_cycle(dt_file, arch_00)) !== nothing
                 return (p00, "wrs")
             end
-
-            # 2) Fall back to previous day's 18Z
             if (p18 = _try_wrs_from_cycle(dt_file, arch_18)) !== nothing
                 return (p18, "wrs")
             end
-
             return (nothing, "wrs")
         end
 
-        # Resolve both bracketing stamps independently with the 00Z→18Z preference
         p_lo_path, prod_lo_used = _resolve_wrs_stamp(dt_lo)
         p_hi_path, prod_hi_used = _resolve_wrs_stamp(dt_hi)
 
-        # Hard error if either side is missing, with clear guidance
-       if p_lo_path === nothing || p_hi_path === nothing
+        if p_lo_path === nothing || p_hi_path === nothing
             missing = String[]
-            if p_lo_path === nothing
-                push!(missing, "low @ $(dt_lo) (tried wrs.$(Dates.format(Date(dt_lo), dateformat"yyyymmdd"))/00 then previous day /18)")
-            end
-            if p_hi_path === nothing
-                push!(missing, "high @ $(dt_hi) (tried wrs.$(Dates.format(Date(dt_hi), dateformat"yyyymmdd"))/00 then previous day /18)")
-            end
-            error("Could not fetch WRS files for $(join(missing, "; ")). " *
-                "This usually means the earliest same-day 00Z products begin later (e.g., ~03:10) " *
-                "and the previous 18Z cycle also does not contain that valid stamp.")
+            p_lo_path === nothing && push!(missing, "low @ $(dt_lo) (wrs 00Z, then prev 18Z)")
+            p_hi_path === nothing && push!(missing, "high @ $(dt_hi) (wrs 00Z, then prev 18Z)")
+            error("Could not fetch WRS files for $(join(missing, \"; \")).")
         end
-
 
         return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
     end
 
-    p_lo = _try_download(itp, dt_lo, pref)
+    # Generic (non-WRS) path: prefer `pref`, then fall back to `alt`. Reuse cached files if present.
+    local function _try_download_or_cache(dt_file::DateTime, product::String)
+        key        = _construct_s3_key(dt_file, product)
+        local_path = normpath(joinpath(DEFAULT_CACHE_DIR, key))
+        if isfile(local_path)
+            return local_path
+        end
+        aws = _aws_cfg(itp.region)
+        try
+            return _download_to_cache(aws, itp.bucket, key;
+                                      cache_dir=DEFAULT_CACHE_DIR, verbose=false)
+        catch
+            return nothing
+        end
+    end
+
+    p_lo = _try_download_or_cache(dt_lo, pref)
     prod_lo = p_lo === nothing ? begin
-        p = _try_download(itp, dt_lo, alt)
+        p = _try_download_or_cache(dt_lo, alt)
         p === nothing ? nothing : (p, alt)
     end : (p_lo, pref)
 
-    p_hi = _try_download(itp, dt_hi, pref)
+    p_hi = _try_download_or_cache(dt_hi, pref)
     prod_hi = p_hi === nothing ? begin
-        p = _try_download(itp, dt_hi, alt)
+        p = _try_download_or_cache(dt_hi, alt)
         p === nothing ? nothing : (p, alt)
     end : (p_hi, pref)
 
@@ -849,14 +860,17 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
         missing_sides = String[]
         prod_lo === nothing && push!(missing_sides, "low @ $(dt_lo)")
         prod_hi === nothing && push!(missing_sides, "high @ $(dt_hi)")
-        error("Could not fetch files for $(join(missing_sides, ", ")); tried products $(pref), $(alt).")
+        error("Could not fetch files for $(join(missing_sides, \", \")); tried $(pref), $(alt).")
     end
 
     p_lo_path, prod_lo_used = prod_lo
     p_hi_path, prod_hi_used = prod_hi
+
+    if prod_lo_used != prod_hi_used
+        @info "[mix] Using mixed products: low=$(prod_lo_used), high=$(prod_hi_used)"
+    end
     return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
 end
-
 
 
 #  Time utilities
@@ -1446,7 +1460,7 @@ function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real,
 
     # 1) Find local cached file paths (does S3 download if missing)
     p_lo, p_hi, prod_lo, prod_hi = _get_two_files_exact(itp, dt)
-    @debug "[fetch] Using files: low=[$(prod_lo)] $(basename(p_lo)), high=[$(prod_hi)] $(basename(p_hi))"
+    @info "[fetch] Using files: low=[$(prod_lo)] $(basename(p_lo)), high=[$(prod_hi)] $(basename(p_hi))"
 
     # 2) Open via pooled handles (pin); do NOT close—just unpin in finally
     ds_lo = _open_nc_cached(p_lo)
