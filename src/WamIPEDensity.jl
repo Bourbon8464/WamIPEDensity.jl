@@ -843,7 +843,7 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
             missing = String[]
             p_lo_path === nothing && push!(missing, "low @ $(dt_lo) (wrs 00Z, then prev 18Z)")
             p_hi_path === nothing && push!(missing, "high @ $(dt_hi) (wrs 00Z, then prev 18Z)")
-            error("Could not fetch WRS files for $(join(missing, \"; \")).")
+            error("Could not fetch WRS files for $(join(missing, "; ")).")
         end
 
         _cache_filepair!(itp.product, dt, p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
@@ -1657,7 +1657,7 @@ function get_density_trajectory(itp::WAMInterpolator,
     if !angles_in_deg
         latv .= rad2deg.(latv)
         lonv .= rad2deg.(lonv)
-    end
+    endƒ√
 
     return get_density_batch(itp, dts, latv, lonv, altkm)
 end
