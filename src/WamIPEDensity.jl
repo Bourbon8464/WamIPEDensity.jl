@@ -38,8 +38,38 @@ Base.@kwdef struct WAMInterpolator
     interpolation::Symbol = :sciml
 end
 
-
 # Helpers 
+
+function _cf_decode!(A::AbstractArray, var::NCDatasets.Variable)
+    attrs = Dict(var.attrib)
+    sf = haskey(attrs, "scale_factor") ? float(attrs["scale_factor"]) : 1.0
+    ao = haskey(attrs, "add_offset")   ? float(attrs["add_offset"])   : 0.0
+    fillvals = Set{Float64}()
+    for k in ("_FillValue","missing_value")
+        if haskey(attrs, k)
+            v = attrs[k]
+            if v isa AbstractArray
+                for x in v; push!(fillvals, float(x)); end
+            else
+                push!(fillvals, float(v))
+            end
+        end
+    end
+    # convert to Float64 once
+    B = Float64.(A)
+    # mask fills
+    if !isempty(fillvals)
+        @inbounds for i in eachindex(B)
+            @fastmath if B[i] in fillvals; B[i] = NaN; end
+        end
+    end
+    # apply affine decode if needed
+    if sf != 1.0 || ao != 0.0
+        @inbounds @fastmath B .= B .* sf .+ ao
+    end
+    return B
+end
+
 
 """
     _aws_cfg(region) returns AWS.AWSConfig
@@ -713,20 +743,23 @@ end
 
 
 
-#  Time utilities 
+#  Time utilities
 function _decode_time_units(ds::NCDataset, tname::String, t::AbstractVector)
     units = get(ds[tname].attrib, "units", "")
-    m = match(r"(seconds|minutes|hours|days) since (\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2}))?", units)
+    cal   = lowercase(string(get(ds[tname].attrib, "calendar", "gregorian")))
+    m = match(r"(seconds|minutes|hours|days)\s+since\s+(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2}))?", units)
     if m === nothing
-        return t, nothing, nothing  # keep DateTime axis as is
+        return t, nothing, nothing  # keep axis as already provided (often DateTime)
     end
     scale = m.captures[1]
     epoch_date = Date(m.captures[2])
     epoch_time = m.captures[3] === nothing ? Time(0) : Time(m.captures[3])
     epoch = DateTime(epoch_date, epoch_time)
 
+    # For exotic calendars, we’ll still treat deltas as civil days/seconds.
+    # If you need exact 360_day arithmetic, we can add a specialized converter later.
     if eltype(t) <: DateTime
-        tnum = [ _encode_query_time(tt, epoch, scale) for tt in t ]
+        tnum = [_encode_query_time(tt, epoch, scale) for tt in t]
         return tnum, epoch, scale
     else
         return collect(t), epoch, scale
@@ -871,6 +904,16 @@ function _load_grids(ds::NCDataset, varname::String; file_time::Union{DateTime,N
 
         perm = (idx_lon, idx_lat, idx_z, idx_time)
         V    = perm == (1,2,3,4) ? Vraw : Array(PermutedDimsArray(Vraw, perm))
+
+        # >>> CF decode + fill→NaN <<<
+        V = _cf_decode!(V, v)
+
+        # (optional) sanity checks on coord units
+        latunits = lowercase(string(get(ds[latname].attrib, "units", "")))
+        lonunits = lowercase(string(get(ds[lonname].attrib, "units", "")))
+        if !occursin("degrees_north", latunits); @warn "Latitude units are '$latunits' (expected degrees_north)."; end
+        if !occursin("degrees_east",  lonunits); @warn "Longitude units are '$lonunits' (expected degrees_east)."; end
+
         return lat, lon, z, t, V, (latname, lonname, zname, tname)
 
     elseif nd == 3
@@ -896,12 +939,25 @@ function _load_grids(ds::NCDataset, varname::String; file_time::Union{DateTime,N
         # Expand to 4-D by adding a singleton time dimension at the end
         V    = reshape(V3, size(V3,1), size(V3,2), size(V3,3), 1)
 
+        # >>> CF decode + fill→NaN <<<
+        V = _cf_decode!(V, v)
+
+        latunits = lowercase(string(get(ds[latname].attrib, "units", "")))
+        lonunits = lowercase(string(get(ds[lonname].attrib, "units", "")))
+        if !occursin("degrees_north", latunits)
+            @warn "Latitude units are '$latunits' (expected degrees_north). Results may be incorrect."
+        end
+        if !occursin("degrees_east", lonunits)
+            @warn "Longitude units are '$lonunits' (expected degrees_east). Results may be incorrect."
+        end
+
         return lat, lon, z, t, V, (latname, lonname, zname, tname)
 
     else
         error("Expected 3D or 4D var '$varname', got ndims=$(nd) with dims=$(dnames)")
     end
 end
+
 
 
 # Convert query altitude (km) to the dataset's vertical axis units.
@@ -1385,5 +1441,6 @@ function get_density_trajectory(itp::WAMInterpolator,
 
     return get_density_batch(itp, dts, latv, lonv, altkm)
 end
+
 
 end # module
