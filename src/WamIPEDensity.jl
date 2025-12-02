@@ -12,6 +12,7 @@ using EzXML
 using URIs
 using DataInterpolations
 using Serialization
+using CommonDataModel
 
 const DEFAULT_CACHE_DIR = normpath("./cache") # DEFAULT_CACHE_DIR = abspath(joinpath(@__DIR__, "..", "cache"))
 
@@ -40,14 +41,25 @@ end
 
 # Helpers 
 
-function _cf_decode!(A::AbstractArray, var::NCDatasets.Variable)
-    attrs = Dict(var.attrib)
-    sf = haskey(attrs, "scale_factor") ? float(attrs["scale_factor"]) : 1.0
-    ao = haskey(attrs, "add_offset")   ? float(attrs["add_offset"])   : 0.0
+# CF-compliant decode (scale_factor/add_offset + fill to NaN) for any CDM variable
+function _cf_decode!(A::AbstractArray, var)
+    # get a string-keyed attribute dict regardless of concrete var type
+    attrs_any = try
+        # works for NCDatasets.Variable
+        Dict(var.attrib)
+    catch
+        # works for CFVariable and friends
+        Dict(CommonDataModel.attributes(var))
+    end
+
+    sf = haskey(attrs_any, "scale_factor") ? float(attrs_any["scale_factor"]) : 1.0
+    ao = haskey(attrs_any, "add_offset")   ? float(attrs_any["add_offset"])   : 0.0
+
+    # collect any declared fill/missing sentinels
     fillvals = Set{Float64}()
     for k in ("_FillValue","missing_value")
-        if haskey(attrs, k)
-            v = attrs[k]
+        if haskey(attrs_any, k)
+            v = attrs_any[k]
             if v isa AbstractArray
                 for x in v; push!(fillvals, float(x)); end
             else
@@ -55,18 +67,22 @@ function _cf_decode!(A::AbstractArray, var::NCDatasets.Variable)
             end
         end
     end
-    # convert to Float64 once
+
+    # decode into Float64 buffer
     B = Float64.(A)
-    # mask fills
+
+    # mask fills → NaN
     if !isempty(fillvals)
         @inbounds for i in eachindex(B)
             @fastmath if B[i] in fillvals; B[i] = NaN; end
         end
     end
-    # apply affine decode if needed
+
+    # apply affine decoding if present
     if sf != 1.0 || ao != 0.0
         @inbounds @fastmath B .= B .* sf .+ ao
     end
+
     return B
 end
 
