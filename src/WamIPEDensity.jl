@@ -780,6 +780,7 @@ const _WRS_00Z_FIRST_TIME = Time(3, 10, 0)  # first valid file under 00Z folder 
 _have_in_cache(key::AbstractString; cache_dir::AbstractString=DEFAULT_CACHE_DIR) =
     isfile(normpath(joinpath(cache_dir, key)))
 
+# Drop-in replacement: prefers cached files; only hits S3 if missing
 function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     dt_lo, dt_hi = _surrounding_10min(dt)
     pref, alt    = _product_fallback_order(itp.product)  # e.g., ("wfs","wrs") or ("wrs","wfs")
@@ -795,8 +796,7 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
                 return local_path
             end
             try
-                return _download_to_cache(aws, itp.bucket, key;
-                                          cache_dir=DEFAULT_CACHE_DIR, verbose=false)
+                return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=false)
             catch
                 return nothing
             end
@@ -822,7 +822,7 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
             missing = String[]
             p_lo_path === nothing && push!(missing, "low @ $(dt_lo) (wrs 00Z, then prev 18Z)")
             p_hi_path === nothing && push!(missing, "high @ $(dt_hi) (wrs 00Z, then prev 18Z)")
-            error("Could not fetch WRS files for $(join(missing, \"; \")).")
+            error("Could not fetch WRS files for $(join(missing, "; ")).")
         end
 
         return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
@@ -837,8 +837,7 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
         end
         aws = _aws_cfg(itp.region)
         try
-            return _download_to_cache(aws, itp.bucket, key;
-                                      cache_dir=DEFAULT_CACHE_DIR, verbose=false)
+            return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=false)
         catch
             return nothing
         end
@@ -860,12 +859,11 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
         missing_sides = String[]
         prod_lo === nothing && push!(missing_sides, "low @ $(dt_lo)")
         prod_hi === nothing && push!(missing_sides, "high @ $(dt_hi)")
-        error("Could not fetch files for $(join(missing_sides, \", \")); tried $(pref), $(alt).")
+        error("Could not fetch files for $(join(missing_sides, ", ")); tried $(pref), $(alt).")
     end
 
     p_lo_path, prod_lo_used = prod_lo
     p_hi_path, prod_hi_used = prod_hi
-
     if prod_lo_used != prod_hi_used
         @info "[mix] Using mixed products: low=$(prod_lo_used), high=$(prod_hi_used)"
     end
