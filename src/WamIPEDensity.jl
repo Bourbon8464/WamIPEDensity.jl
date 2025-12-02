@@ -1486,7 +1486,13 @@ function get_density_batch(itp::WAMInterpolator, dts::AbstractVector{<:DateTime}
                            lats::AbstractVector, lons::AbstractVector, alts_km::AbstractVector)
     n = length(dts)
     @assert length(lats)==n==length(lons)==length(alts_km)
-    [get_density(itp, dts[i], lats[i], lons[i], alts_km[i]) for i in 1:n]
+    
+    # Parallel version
+    results = Vector{Float64}(undef, n)
+    Threads.@threads for i in 1:n
+        results[i] = get_density(itp, dts[i], lats[i], lons[i], alts_km[i])
+    end
+    return results
 end
 
 # function get_density_from_key(itp::WAMInterpolator, key::AbstractString,
@@ -1619,5 +1625,85 @@ function get_density_trajectory(itp::WAMInterpolator,
     return get_density_batch(itp, dts, latv, lonv, altkm)
 end
 
+function get_density_trajectory_optimized(itp::WAMInterpolator,
+                                         dts::AbstractVector{<:DateTime},
+                                         lats::AbstractVector,
+                                         lons::AbstractVector,
+                                         alts_m::AbstractVector;
+                                         angles_in_deg::Bool = false)
+    n = length(dts)
+    latv = angles_in_deg ? Float64.(lats) : rad2deg.(Float64.(lats))
+    lonv = angles_in_deg ? Float64.(lons) : rad2deg.(Float64.(lons))
+    altkm = Float64.(alts_m) .* 1e-3
+    
+    # Group queries by which file pair they need
+    file_groups = Dict{Tuple{String,String}, Vector{Int}}()
+    for i in 1:n
+        p_lo, p_hi, _, _ = _get_two_files_exact(itp, dts[i])
+        key = (p_lo, p_hi)
+        push!(get!(file_groups, key, Int[]), i)
+    end
+    
+    results = Vector{Float64}(undef, n)
+    
+    # Process each file pair only once
+    for ((p_lo, p_hi), indices) in file_groups
+        ds_lo = _open_nc_cached(p_lo)
+        ds_hi = _open_nc_cached(p_hi)
+        
+        try
+            # Load grids once per file pair
+            t_lo = _parse_valid_time_from_key(p_lo)
+            t_hi = _parse_valid_time_from_key(p_hi)
+            
+            lat_lo, lon_lo, z_lo, t_lo_arr, V_lo, names_lo = _load_grids(ds_lo, itp.varname; file_time=t_lo)
+            lat_hi, lon_hi, z_hi, t_hi_arr, V_hi, names_hi = _load_grids(ds_hi, itp.varname; file_time=t_hi)
+            
+            tdts_lo, epoch_lo, scale_lo = _decode_time_units(ds_lo, names_lo[4], t_lo_arr)
+            tdts_hi, epoch_hi, scale_hi = _decode_time_units(ds_hi, names_hi[4], t_hi_arr)
+            
+            # Interpolate all points using this file pair
+            mode = _normalize_interp(itp.interpolation)
+            for idx in indices
+                zq_lo = _maybe_convert_alt(z_lo, altkm[idx], ds_lo, names_lo[3])
+                zq_hi = _maybe_convert_alt(z_hi, altkm[idx], ds_hi, names_hi[3])
+                
+                tq_lo = (epoch_lo === nothing) ? t_lo : _encode_query_time(t_lo, epoch_lo, scale_lo)
+                tq_hi = (epoch_hi === nothing) ? t_hi : _encode_query_time(t_hi, epoch_hi, scale_hi)
+                
+                v_lo = _interp4(lat_lo, lon_lo, z_lo, tdts_lo, V_lo, latv[idx], lonv[idx], zq_lo, tq_lo; mode=mode)
+                v_hi = _interp4(lat_hi, lon_hi, z_hi, tdts_hi, V_hi, latv[idx], lonv[idx], zq_hi, tq_hi; mode=mode)
+                
+                # Temporal interpolation
+                if t_lo == t_hi
+                    results[idx] = float(v_lo)
+                else
+                    itp_t = DataInterpolations.LinearInterpolation(
+                        [float(v_lo), float(v_hi)],
+                        [Dates.value(t_lo), Dates.value(t_hi)]
+                    )
+                    results[idx] = itp_t(Dates.value(dts[idx]))
+                end
+            end
+        finally
+            _unpin_nc_cached(p_lo)
+            _unpin_nc_cached(p_hi)
+        end
+    end
+    
+    return results
+end
+
+function prewarm_cache!(itp::WAMInterpolator, dts::AbstractVector{<:DateTime})
+    unique_files = Set{Tuple{String,String}}()
+    for dt in dts
+        p_lo, p_hi, _, _ = _get_two_files_exact(itp, dt)
+        push!(unique_files, (p_lo, p_hi))
+    end
+    
+    println("Pre-downloading $(length(unique_files)) unique file pairs...")
+    # Files are already downloaded by _get_two_files_exact
+    return length(unique_files)
+end
 
 end # module
