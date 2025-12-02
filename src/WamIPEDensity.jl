@@ -763,6 +763,8 @@ necessary. Throws if either side cannot be found.
 # end
 
 const _WRS_00Z_FIRST_TIME = Time(3, 10, 0)  # first valid file under 00Z folder is ..._031000.nc
+_have_in_cache(key::AbstractString; cache_dir::AbstractString=DEFAULT_CACHE_DIR) =
+    isfile(normpath(joinpath(cache_dir, key)))
 
 function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     dt_lo, dt_hi = _surrounding_10min(dt)
@@ -775,8 +777,16 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
         # Returns String local-path on success, or nothing.
         function _try_wrs_from_cycle(dt_file::DateTime, arch::DateTime)
             key = _construct_wrs_key_with_cycle(dt_file, arch)
+
+            # Short-circuit if already cached on disk
+            if _have_in_cache(key)
+                return normpath(joinpath(DEFAULT_CACHE_DIR, key))
+            end
+
+            # Otherwise download into cache
             try
-                return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=false)
+                return _download_to_cache(aws, itp.bucket, key;
+                                        cache_dir=DEFAULT_CACHE_DIR, verbose=false)
             catch
                 return nothing
             end
