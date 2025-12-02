@@ -13,8 +13,6 @@ using URIs
 using DataInterpolations
 using Serialization
 using CommonDataModel
-using Dates
-using Printf
 
 const _WIPED_RUN_START_WALL = Ref{DateTime}(DateTime(0))
 const _WIPED_RUN_START_NS   = Ref{Int}(0)
@@ -1784,5 +1782,9 @@ function __init__()
         _install_run_timer!()
     end
 end
+
+
+WamIPEDensity.reset_run_timer!()   # marks the start time right now
+
 
 end # module
