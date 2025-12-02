@@ -858,11 +858,12 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     prod_hi = p_hi === nothing ? ((p = _try_product(dt_hi, alt)) === nothing ? nothing : (p, alt)) : (p_hi, pref)
 
     if prod_lo === nothing || prod_hi === nothing
-        missing = String[]
-        prod_lo === nothing && push!(missing, "low @ $(dt_lo)")
-        prod_hi === nothing && push!(missing, "high @ $(dt_hi)"
-        error("Could not fetch files for $(join(missing, ", ")); tried $(pref), $(alt)."))
-    end
+    missing = String[]
+    prod_lo === nothing && push!(missing, "low @ $(dt_lo)")
+    prod_hi === nothing && push!(missing, "high @ $(dt_hi)")
+    error("Could not fetch files for $(join(missing, ", ")); tried $(pref), $(alt).")
+end
+
 
     p_lo_path, prod_lo_used = prod_lo
     p_hi_path, prod_hi_used = prod_hi
