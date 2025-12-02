@@ -147,11 +147,11 @@ function _open_nc_cached(path::String)
             _ds_touch!(_DSPOOL, path)
             return _DSPOOL.map[path]
         else
-            ds = NCDataset(path, "r")
+            ds = NCDataset(path, "r"; attrib=Dict("cache_preemption"=>1.0))
             _DSPOOL.map[path] = ds
             _DSPOOL.pins[path] = 1
             _ds_touch!(_DSPOOL, path)
-            _ds_evict_unpinned!(_DSPOOL)   # keep pool bounded
+            _ds_evict_unpinned!(_DSPOOL)
             return ds
         end
     end
@@ -201,7 +201,7 @@ Returns the local path, atomic and safe for concurrent use.
 function _download_to_cache(aws::AWS.AWSConfig, bucket::String, key::String;
                             cache_dir::AbstractString=DEFAULT_CACHE_DIR,
                             cache_max_bytes::Int=2_000_000_000,
-                            verbose::Bool=true)
+                            verbose::Bool=false)  
     cache = _get_cache(cache_dir, cache_max_bytes)
     return _cache_get_file!(cache, aws, bucket, key; verbose=verbose)
 end
