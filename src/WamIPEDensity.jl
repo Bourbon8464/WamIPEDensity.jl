@@ -13,12 +13,50 @@ using URIs
 using DataInterpolations
 using Serialization
 using CommonDataModel
+using Dates
+using Printf
+
+const _WIPED_RUN_START_WALL = Ref{DateTime}(DateTime(0))
+const _WIPED_RUN_START_NS   = Ref{Int}(0)
+const _WIPED_TIMER_READY    = Ref(false)
+
+function reset_run_timer!()
+    _WIPED_RUN_START_WALL[] = now()
+    _WIPED_RUN_START_NS[]   = time_ns()
+    _WIPED_TIMER_READY[]    = true
+    return nothing
+end
+
+function _install_run_timer!()
+    # mark start
+    _WIPED_RUN_START_WALL[] = now()
+    _WIPED_RUN_START_NS[]   = time_ns()
+    _WIPED_TIMER_READY[]    = true
+
+    atexit() do
+        # only print if we actually started (and not during precompile)
+        if _WIPED_TIMER_READY[] && ccall(:jl_generating_output, Cint, ()) == 0
+            stop_wall     = now()
+            cpu_elapsed_s = (time_ns() - _WIPED_RUN_START_NS[]) / 1e9
+            wall_elapsed_s = Millisecond(stop_wall - _WIPED_RUN_START_WALL[]).value / 1000
+
+            println("=== WamIPEDensity run timing ===")
+            println("Start:  ", Dates.format(_WIPED_RUN_START_WALL[], dateformat"yyyy-mm-dd HH:MM:SS.s"))
+            println("End:    ", Dates.format(stop_wall,                dateformat"yyyy-mm-dd HH:MM:SS.s"))
+            @printf("CPU elapsed : %.3f s\n", cpu_elapsed_s)
+            @printf("Wall elapsed: %.3f s\n", wall_elapsed_s)
+        end
+    end
+
+    return nothing
+end
+
 
 const DEFAULT_CACHE_DIR = normpath("./cache") # DEFAULT_CACHE_DIR = abspath(joinpath(@__DIR__, "..", "cache")) //Tarun
 const _FILEPAIR_CACHE = Dict{Tuple{String,DateTime}, Tuple{String,String,String,String}}()
 const _FILEPAIR_LOCK  = ReentrantLock()
 
-export WAMInterpolator, get_density, get_density_batch, get_density_at_point, get_density_trajectory
+export WAMInterpolator, get_density, get_density_batch, get_density_at_point, get_density_trajectory, reset_run_timer!
 
 """
     WAMInterpolator(; bucket="noaa-nws-wam-ipe-pds", product="wfs", varname="den",
@@ -111,10 +149,6 @@ function _aws_cfg(region::String)
     AWS.AWSConfig(; region=region, creds=nothing)
 end
 
-
-# -------------------------------
-# Open NCDataset pool (LRU, thread-safe)
-# -------------------------------
 mutable struct _DSPool
     map::Dict{String,NCDataset}      # path -> open dataset
     pins::Dict{String,Int}           # path -> active users
@@ -780,7 +814,6 @@ const _WRS_00Z_FIRST_TIME = Time(3, 10, 0)  # first valid file under 00Z folder 
 _have_in_cache(key::AbstractString; cache_dir::AbstractString=DEFAULT_CACHE_DIR) =
     isfile(normpath(joinpath(cache_dir, key)))
 
-# ---------- FAST: 10-min file-pair resolver with RAM + disk caching ----------
 
 @inline function _both_exist(p1::AbstractString, p2::AbstractString)
     isfile(p1) && isfile(p2)
@@ -875,7 +908,6 @@ end
     _cache_filepair!(itp.product, dt, p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
     return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
 end
-# ---------- end fast resolver ----------
 
 
 #  Time utilities
@@ -1745,6 +1777,12 @@ function prewarm_cache!(itp::WAMInterpolator, dts::AbstractVector{<:DateTime})
     println("Pre-downloading $(length(unique_files)) unique file pairs...")
     # Files are already downloaded by _get_two_files_exact
     return length(unique_files)
+end
+
+function __init__()
+    if ccall(:jl_generating_output, Cint, ()) == 0
+        _install_run_timer!()
+    end
 end
 
 end # module
