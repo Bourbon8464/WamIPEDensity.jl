@@ -1,8 +1,9 @@
 name = "WamIPEDensity"
 uuid = "b4be18c8-5d09-4dc7-9320-34e8e308bc8c"
 license = "MIT"
+license_path = "LICENSE"
 authors = ["Bourbon8464 <itarun17@gmail.com>"]
-version = "0.2.5"
+version = "1.0.0"
 
 [deps]
 AWS = "fbe9abb3-538b-5e4e-ba9e-bc94f4f92ebc"
