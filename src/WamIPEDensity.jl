@@ -91,7 +91,6 @@ function _get_cached_filepair(product::String, dt::DateTime)
     end
 end
 
-# CF-compliant decode (scale_factor/add_offset + fill to NaN) for any CDM variable
 function _cf_decode!(A::AbstractArray, var)
     # get a string-keyed attribute dict regardless of concrete var type
     attrs_any = try
@@ -105,7 +104,6 @@ function _cf_decode!(A::AbstractArray, var)
     sf = haskey(attrs_any, "scale_factor") ? float(attrs_any["scale_factor"]) : 1.0
     ao = haskey(attrs_any, "add_offset")   ? float(attrs_any["add_offset"])   : 0.0
 
-    # collect any declared fill/missing sentinels
     fillvals = Set{Float64}()
     for k in ("_FillValue","missing_value")
         if haskey(attrs_any, k)
@@ -166,13 +164,10 @@ const _DSPOOL = _DSPool(Dict{String,NCDataset}(),
     pool.last[path] = time_ns()
 end
 
-# Try evicting unpinned datasets until under cap
 function _ds_evict_unpinned!(pool::_DSPool)
     while length(pool.map) > pool.max_open
-        # candidate set: unpinned only
         unpinned = [p for (p,c) in pool.pins if c == 0]
-        isempty(unpinned) && return  # nothing we can evict safely
-        # pick least-recently-used
+        isempty(unpinned) && return 
         victim = argmin(p -> get(pool.last, p, 0), unpinned)
         try
             close(pool.map[victim])
@@ -185,7 +180,6 @@ function _ds_evict_unpinned!(pool::_DSPool)
     end
 end
 
-# Get/open (and pin) a dataset by local file path
 function _open_nc_cached(path::String)
     lock(_DSPOOL.lock) do
         if haskey(_DSPOOL.map, path)
@@ -209,7 +203,6 @@ function _unpin_nc_cached(path::String)
         if haskey(_DSPOOL.pins, path)
             _DSPOOL.pins[path] = max(0, _DSPOOL.pins[path] - 1)
             _ds_touch!(_DSPOOL, path)
-            # optional: opportunistic eviction if far over cap
             _ds_evict_unpinned!(_DSPOOL)
         end
     end
@@ -531,7 +524,6 @@ function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String,
         isfile(tmp_path) && rm(tmp_path; force=true)
     end
 
-    # - update cache (under lock) -
     lock(cache.lock) do
         # notify and clear downloading flag regardless of success
         if haskey(cache.conds, key)
@@ -556,7 +548,6 @@ function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String,
         cache.bytes += sz
         _lru_touch!(cache, key)
 
-        # evict if needed
         _evict_until_under_budget!(cache)
         _save_cache(cache)
 
@@ -592,7 +583,6 @@ function _try_download(itp::WAMInterpolator, dt::DateTime, product::String)
     aws = _aws_cfg(itp.region)
     key = _construct_s3_key(dt, product)
 
-    # NEW: short-circuit if already cached on disk
     if _have_in_cache(key)
         return normpath(joinpath(DEFAULT_CACHE_DIR, key))
     end
@@ -745,7 +735,7 @@ end
 
 _product_fallback_order(product::String) = product == "wfs" ? ("wfs","wrs") : ("wrs","wfs")
 
-# Build a WRS key but forcing the archive (cycle) hour you want
+# Build a WRS key but forcing the archive (cycle) hour
 function _construct_wrs_key_with_cycle(dt::DateTime, arch::DateTime)::String
     v     = _version_for(dt)
     model = _model_for_version(v)
@@ -771,42 +761,6 @@ Resolve and fetch the two local files that bracket the 10-minute stamp `dt`.
 Prefers the configured product, but will fall back to the alternate product if
 necessary. Throws if either side cannot be found.
 """
-
-# function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
-#     dt_lo, dt_hi = _surrounding_10min(dt)
-#     pref, alt = _product_fallback_order(itp.product)  # e.g., ("wfs","wrs")
-
-#     #  lower bracket: prefer `pref`, fall back to `alt` 
-#     p_lo = _try_download(itp, dt_lo, pref)
-#     prod_lo = p_lo === nothing ? begin
-#         p = _try_download(itp, dt_lo, alt)
-#         p === nothing ? nothing : (p, alt)
-#     end : (p_lo, pref)
-
-#     # upper bracket: prefer `pref`, fall back to `alt` 
-#     p_hi = _try_download(itp, dt_hi, pref)
-#     prod_hi = p_hi === nothing ? begin
-#         p = _try_download(itp, dt_hi, alt)
-#         p === nothing ? nothing : (p, alt)
-#     end : (p_hi, pref)
-
-#     # Validate we got both
-#     if prod_lo === nothing || prod_hi === nothing
-#         missing_sides = String[]
-#         prod_lo === nothing && push!(missing_sides, "low @ $(dt_lo)")
-#         prod_hi === nothing && push!(missing_sides, "high @ $(dt_hi)")
-#         error("Could not fetch files for $(join(missing_sides, ", ")); tried products $(pref), $(alt).")
-#     end
-
-#     p_lo_path, prod_lo_used = prod_lo
-#     p_hi_path, prod_hi_used = prod_hi
-
-#     if prod_lo_used != prod_hi_used
-#         @info "[mix] Using mixed products: low=$(prod_lo_used), high=$(prod_hi_used)"
-#     end
-
-#     return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
-# end
 
 const _WRS_00Z_FIRST_TIME = Time(3, 10, 0)  # first valid file under 00Z folder is ..._031000.nc
 _have_in_cache(key::AbstractString; cache_dir::AbstractString=DEFAULT_CACHE_DIR) =
@@ -900,7 +854,7 @@ end
     p_hi_path, prod_hi_used = prod_hi
 
     if prod_lo_used != prod_hi_used
-        @info "[mix] Using mixed products: low=$(prod_lo_used), high=$(prod_hi_used)"
+        @debug "[mix] Using mixed products: low=$(prod_lo_used), high=$(prod_hi_used)"
     end
 
     _cache_filepair!(itp.product, dt, p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
@@ -921,8 +875,6 @@ function _decode_time_units(ds::NCDataset, tname::String, t::AbstractVector)
     epoch_time = m.captures[3] === nothing ? Time(0) : Time(m.captures[3])
     epoch = DateTime(epoch_date, epoch_time)
 
-    # For exotic calendars, we’ll still treat deltas as civil days/seconds.
-    # If you need exact 360_day arithmetic, we can add a specialized converter later.
     if eltype(t) <: DateTime
         tnum = [_encode_query_time(tt, epoch, scale) for tt in t]
         return tnum, epoch, scale
@@ -975,9 +927,6 @@ function _pick_file(objs::AbstractVector; target_dt::Union{DateTime,Nothing}=not
         delta   = vt === nothing ? Day(9999) : abs(target_dt - vt)
         (delta, key, o)
     end
-
-    # Argmin by the first field (delta), ties broken by the second (key)
-    # findmin returns (min_tuple, idx)
     _, idx = findmin(scored)
     return scored[idx][3]   # the `o`
 end
@@ -1004,7 +953,6 @@ function _load_grids(ds::NCDataset, varname::String; file_time::Union{DateTime,N
 
     dnames = String.(NCDatasets.dimnames(v))  # names like "time","height","latitude","longitude", etc.
 
-    # Helper to classify a dimension by inspecting name + attributes
     function classify_dim(dname::String)
         lname = lowercase(dname)
         var   = haskey(ds, dname) ? ds[dname] : nothing  # coord var 
@@ -1070,10 +1018,8 @@ function _load_grids(ds::NCDataset, varname::String; file_time::Union{DateTime,N
         perm = (idx_lon, idx_lat, idx_z, idx_time)
         V    = perm == (1,2,3,4) ? Vraw : Array(PermutedDimsArray(Vraw, perm))
 
-        # >>> CF decode + fill→NaN <<<
         V = _cf_decode!(V, v)
 
-        # (optional) sanity checks on coord units
         latunits = lowercase(string(get(ds[latname].attrib, "units", "")))
         lonunits = lowercase(string(get(ds[lonname].attrib, "units", "")))
         if !occursin("degrees_north", latunits); @warn "Latitude units are '$latunits' (expected degrees_north)."; end
@@ -1104,7 +1050,6 @@ function _load_grids(ds::NCDataset, varname::String; file_time::Union{DateTime,N
         # Expand to 4-D by adding a singleton time dimension at the end
         V    = reshape(V3, size(V3,1), size(V3,2), size(V3,3), 1)
 
-        # >>> CF decode + fill→NaN <<<
         V = _cf_decode!(V, v)
 
         latunits = lowercase(string(get(ds[latname].attrib, "units", "")))
@@ -1434,7 +1379,7 @@ end
 _normalize_interp(s::Symbol) = (s === :sciml ? :logz_quadratic : s)
 
 
-#  Public API -
+#  Public API 
 
 """
     get_density(itp::WAMInterpolator, dt::DateTime, lat::Real, lon::Real, alt_km::Real)
@@ -1442,60 +1387,12 @@ _normalize_interp(s::Symbol) = (s === :sciml ? :logz_quadratic : s)
 Return neutral density at (`dt`, `lat`, `lon`, `alt_km`) using WAM‑IPE outputs.
 """
 
-# function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
-#     mode = _validate_query_args(itp.interpolation, dt, latq, lonq, alt_km)
-
-#     # 1) Get bracketing local files by constructing exact keys (with 6-hour cycle rules)
-#     p_lo, p_hi, prod_lo, prod_hi = _get_two_files_exact(itp, dt)
-#     @info "[fetch] Using files: low=[$(prod_lo)] $(basename(p_lo)), high=[$(prod_hi)] $(basename(p_hi))"
-
-#     # 2) Open both datasets
-#     ds_lo = NCDataset(p_lo, "r")
-#     ds_hi = NCDataset(p_hi, "r")
-
-    
-#     # 3) Parse each file’s valid time from its filename (YYYYMMDD_HHMMSS)
-#     t_lo = _parse_valid_time_from_key(p_lo)
-#     t_hi = _parse_valid_time_from_key(p_hi)
-#     t_lo === nothing && (t_lo = t_hi)
-#     t_hi === nothing && (t_hi = t_lo)
-
-#     try
-#         # - low file spatial value at its own valid time -
-#         lat, lon, z, t, V, (latname, lonname, zname, tname) =
-#             _load_grids(ds_lo, itp.varname; file_time=t_lo)
-#         tdts, epoch, scale = _decode_time_units(ds_lo, tname, t)
-#         tq_lo = (epoch === nothing) ? t_lo : _encode_query_time(t_lo, epoch, scale)
-#         zq_lo = _maybe_convert_alt(z, alt_km, ds_lo, zname)
-#         v_lo  = _interp4(lat, lon, z, tdts, V,  latq, lonq, zq_lo, tq_lo; mode=mode)
-
-#         # - high file spatial value at its own valid time -
-#         lat2, lon2, z2, t2, V2, (latname2, lonname2, zname2, tname2) =
-#             _load_grids(ds_hi, itp.varname; file_time=t_hi)
-#         tdts2, epoch2, scale2 = _decode_time_units(ds_hi, tname2, t2)
-#         tq_hi = (epoch2 === nothing) ? t_hi : _encode_query_time(t_hi, epoch2, scale2)
-#         zq_hi = _maybe_convert_alt(z2, alt_km, ds_hi, zname2)
-#         v_hi  = _interp4(lat2, lon2, z2, tdts2, V2, latq, lonq, zq_hi, tq_hi; mode=mode)
-
-#         # 4) Temporal linear blend at query dt
-#         if t_lo == t_hi
-#             return float(v_lo)
-#         else
-#             itp_t = DataInterpolations.LinearInterpolation([float(v_lo), float(v_hi)],
-#                 [Dates.value(t_lo), Dates.value(t_hi)])
-#             return itp_t(Dates.value(dt))
-#         end
-#     finally
-#         close(ds_lo); close(ds_hi)
-#     end
-# end
-
 function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
     mode = _validate_query_args(itp.interpolation, dt, latq, lonq, alt_km)
 
     # 1) Find local cached file paths (does S3 download if missing)
     p_lo, p_hi, prod_lo, prod_hi = _get_two_files_exact(itp, dt)
-    @info "[fetch] Using files: low=[$(prod_lo)] $(basename(p_lo)), high=[$(prod_hi)] $(basename(p_hi))"
+    @debug "[fetch] Using files: low=[$(prod_lo)] $(basename(p_lo)), high=[$(prod_hi)] $(basename(p_hi))"
 
     # 2) Open via pooled handles (pin); do NOT close—just unpin in finally
     ds_lo = _open_nc_cached(p_lo)
@@ -1508,7 +1405,6 @@ function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real,
     t_hi === nothing && (t_hi = t_lo)
 
     try
-        # -- low file at its own valid time --
         lat, lon, z, t, V, (latname, lonname, zname, tname) =
             _load_grids(ds_lo, itp.varname; file_time=t_lo)
         tdts, epoch, scale = _decode_time_units(ds_lo, tname, t)
@@ -1516,7 +1412,6 @@ function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real,
         zq_lo = _maybe_convert_alt(z, alt_km, ds_lo, zname)
         v_lo  = _interp4(lat, lon, z, tdts, V, latq, lonq, zq_lo, tq_lo; mode=mode)
 
-        # -- high file at its own valid time --
         lat2, lon2, z2, t2, V2, (latname2, lonname2, zname2, tname2) =
             _load_grids(ds_hi, itp.varname; file_time=t_hi)
         tdts2, epoch2, scale2 = _decode_time_units(ds_hi, tname2, t2)
@@ -1560,25 +1455,6 @@ function get_density_batch(itp::WAMInterpolator, dts::AbstractVector{<:DateTime}
     end
     return results
 end
-
-# function get_density_from_key(itp::WAMInterpolator, key::AbstractString,
-#                               dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
-#     mode = _normalize_interp(itp.interpolation)   # or reuse _validate_query_args if you want full checks
-#     aws = _aws_cfg(itp.region)
-#     ds, tmp = _open_nc_from_s3(aws, itp.bucket, String(key))
-#     try
-#         t_file = _parse_valid_time_from_key(String(key))
-#         lat, lon, z, t, V, (latname, lonname, zname, tname) = _load_grids(ds, itp.varname; file_time=t_file)
-
-#         tdts, epoch, scale = _decode_time_units(ds, tname, t)
-#         tq = (epoch === nothing) ? (t_file === nothing ? dt : t_file) : _encode_query_time(dt, epoch, scale)
-
-#         zq = _maybe_convert_alt(z, alt_km, ds, zname)
-#         return _interp4(lat, lon, z, tdts, V, latq, lonq, zq, tq; mode=mode)
-#     finally
-#         close(ds); isfile(tmp) && rm(tmp; force=true)
-#     end
-# end
 
 function get_density_from_key(itp::WAMInterpolator, key::AbstractString,
                               dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
