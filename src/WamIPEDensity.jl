@@ -19,43 +19,6 @@ using CSV, DataFrames
 using FilePathsBase: joinpath
 using Base: mkpath
 
-
-const _WIPED_RUN_START_WALL = Ref{DateTime}(DateTime(0))
-const _WIPED_RUN_START_NS   = Ref{Int}(0)
-const _WIPED_TIMER_READY    = Ref(false)
-
-function reset_run_timer!()
-    _WIPED_RUN_START_WALL[] = now()
-    _WIPED_RUN_START_NS[]   = time_ns()
-    _WIPED_TIMER_READY[]    = true
-    return nothing
-end
-
-function _install_run_timer!()
-    # mark start
-    _WIPED_RUN_START_WALL[] = now()
-    _WIPED_RUN_START_NS[]   = time_ns()
-    _WIPED_TIMER_READY[]    = true
-
-    atexit() do
-        # only print if we actually started (and not during precompile)
-        if _WIPED_TIMER_READY[] && ccall(:jl_generating_output, Cint, ()) == 0
-            stop_wall     = now()
-            cpu_elapsed_s = (time_ns() - _WIPED_RUN_START_NS[]) / 1e9
-            wall_elapsed_s = Millisecond(stop_wall - _WIPED_RUN_START_WALL[]).value / 1000
-
-            println("=== WamIPEDensity run timing ===")
-            println("Start:  ", Dates.format(_WIPED_RUN_START_WALL[], dateformat"yyyy-mm-dd HH:MM:SS.s"))
-            println("End:    ", Dates.format(stop_wall,                dateformat"yyyy-mm-dd HH:MM:SS.s"))
-            @printf("CPU elapsed : %.3f s\n", cpu_elapsed_s)
-            @printf("Wall elapsed: %.3f s\n", wall_elapsed_s)
-        end
-    end
-
-    return nothing
-end
-
-
 const DEFAULT_CACHE_DIR = normpath("./cache") # DEFAULT_CACHE_DIR = abspath(joinpath(@__DIR__, "..", "cache")) //Tarun
 const _FILEPAIR_CACHE = Dict{Tuple{String,DateTime}, Tuple{String,String,String,String}}()
 const _FILEPAIR_LOCK  = ReentrantLock()
@@ -1885,9 +1848,5 @@ function __init__()
         _install_run_timer!()
     end
 end
-
-
-WamIPEDensity.reset_run_timer!()   # marks the start time right now
-
 
 end # module
