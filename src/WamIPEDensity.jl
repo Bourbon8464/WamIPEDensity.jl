@@ -15,7 +15,10 @@ using Serialization
 using CommonDataModel
 using Plots
 using CairoMakie 
-using CSV, DataFrames  
+using CSV, DataFrames 
+using FilePathsBase: joinpath
+using Base: mkpath
+
 
 const _WIPED_RUN_START_WALL = Ref{DateTime}(DateTime(0))
 const _WIPED_RUN_START_NS   = Ref{Int}(0)
@@ -260,7 +263,7 @@ function plot_global_mean_profile(itp::WAMInterpolator, dt::DateTime;
         ylabel = "Altitude, km",
         legend = false,
         framestyle = :box,
-        grid = true,  # <-- set grid via attribute (not grid!)
+        grid = true, 
         title = "Global Mean Density — " * Dates.format(dt, dateformat"yyyy-mm-dd HH:MM 'UTC'")
     )
     Plots.ylims!(p, (0, min(alt_max_km, maximum(altp))))
@@ -272,63 +275,91 @@ function plot_global_mean_profile(itp::WAMInterpolator, dt::DateTime;
 end
 
 
+function _extend_profile_to_zero(alt_km::AbstractVector{<:Real},
+                                 dens::AbstractVector{<:Real})
+    if any(abs.(alt_km) .<= 1e-8)
+        return collect(alt_km), collect(dens)
+    end
+    mask = .!(isnan.(dens) .| isinf.(dens) .| (dens .<= 0))
+    a = collect(alt_km[mask]); d = collect(dens[mask])
+    if length(a) < 2
+        return vcat(0.0, collect(alt_km)), vcat(first(dens), collect(dens))
+    end
+    p = sortperm(a)
+    a1, a2 = a[p[1]], a[p[2]]
+    d1, d2 = d[p[1]], d[p[2]]
+    d0 = (a2 == a1) ? d1 : begin
+        m = (log(d2) - log(d1)) / (a2 - a1)
+        b = log(d1) - m*a1
+        val = exp(b)
+        (isfinite(val) && val > 0) ? val : d1
+    end
+    return vcat(0.0, collect(alt_km)), vcat(d0, collect(dens))
+end
 
 """
     plot_global_mean_profile_makie(itp, dt;
-        alt_max_km::Union{Nothing,Real}=nothing,
-        savepath::AbstractString = "global_mean.png",
-        export_csv::Bool = false,
-        csv_path::Union{Nothing,AbstractString} = nothing)
+        alt_max_km = nothing,
+        extend_to0 = false,
+        savepath   = nothing,     # if provided, overrides auto path for PNG only
+        export_csv = false,
+        base_dir   = "plots")     # auto base directory for assets
 
-Makie/CairoMakie version of the global-mean density profile plot.
-- Autoscaling axes by default (like MATLAB). If you want a hard cap on altitude, pass `alt_max_km=<number>`.
-- `export_csv=true` will also write the data to CSV at `csv_path` (or `savepath` with `.csv` extension).
+Creates (if needed) `plots/<product>/<YYYYMMDDTHHMMSS>/` and saves
+`global_mean_profile.png` (and `.csv` if requested) there.
+Returns `(fig, ax, png_path, csv_path_or_nothing)`.
 """
 function plot_global_mean_profile_makie(itp::WAMInterpolator, dt::DateTime;
-        alt_max_km::Union{Nothing,Real}=nothing,
-        savepath::AbstractString = "global_mean.png",
-        export_csv::Bool = false,
-        csv_path::Union{Nothing,AbstractString} = nothing)
-
-    # compute data
+    alt_max_km::Union{Nothing,Real}=nothing,
+    extend_to0::Bool=false,
+    savepath::Union{Nothing,String}=nothing,
+    export_csv::Bool=false,
+    base_dir::AbstractString="plots",
+)
     alt_km, dens = mean_density_profile(itp, dt)
 
-    # clean & (optionally) clip
-    mask = .!(isnan.(dens) .| isinf.(dens))
-    altp = alt_km[mask]
-    denp = dens[mask]
-
-    if alt_max_km !== nothing
-        clip = altp .<= float(alt_max_km)
-        altp = altp[clip]
-        denp = denp[clip]
+    # clean/log-safe; then optional 0-km extension
+    mask = .!(isnan.(dens) .| isinf.(dens) .| (dens .<= 0))
+    altp = alt_km[mask]; denp = dens[mask]
+    if extend_to0
+        altp, denp = _extend_profile_to_zero(altp, denp)
     end
 
-    # optional CSV export
-    if export_csv
-        _csv = csv_path === nothing ? replace(savepath, r"\.[^.]+$" => "") * ".csv" : String(csv_path)
-        CSV.write(_csv, DataFrame(alt_km = altp, density = denp))
-        @info "Wrote CSV" _csv
-    end
+    stamp   = Dates.format(dt, dateformat"yyyymmddTHHMMSS")
+    outdir  = joinpath(base_dir, itp.product, stamp)
+    mkpath(outdir)
 
-    # headless-safe plotting
-    CairoMakie.activate!()  # ensure file backend
-    fig = Figure(resolution = (800, 650))
-    ax = Axis(fig[1,1];
-        xlabel = "Density, kg/m^3",
-        ylabel = "Altitude, km",
-        title  = "Global Mean Density — " * Dates.format(dt, dateformat"yyyy-mm-dd HH:MM 'UTC'"),
-        xscale = log10,         # log x-axis
-        yreversed = false       # natural bottom->top increase
+    default_png = joinpath(outdir, "global_mean_profile.png")
+    png_path    = savepath === nothing ? default_png : String(savepath)
+    csv_path    = export_csv ? joinpath(outdir, "global_mean_profile.csv") : nothing
+
+    CairoMakie.activate!()
+    fig = CairoMakie.Figure(resolution = (800, 600))
+    ax  = CairoMakie.Axis(fig[1,1];
+        xlabel = "Density (kg·m⁻³)",
+        ylabel = "Altitude (km)",
+        xscale = CairoMakie.log10,
+        title  = "Global Mean Density — " * Dates.format(dt, dateformat"yyyy-mm-dd HH:MM 'UTC'")
     )
+    CairoMakie.lines!(ax, denp, altp)
+    if alt_max_km !== nothing
+        CairoMakie.ylims!(ax, nothing, float(alt_max_km))
+    end
+    CairoMakie.autolimits!(ax)
 
-    lines!(ax, denp, altp)
-    axislegend(ax, visible=false)  # no legend needed
-    fig.savefig(savepath)
-    @info "Saved figure" savepath
-    return fig
+    CairoMakie.save(png_path, fig)
+
+    if export_csv
+        open(csv_path, "w") do io
+            write(io, "altitude_km,density_kg_m3\n")
+            @inbounds for i in eachindex(altp)
+                write(io, string(altp[i], ",", denp[i], "\n"))
+            end
+        end
+    end
+
+    return fig, ax, png_path, csv_path
 end
-
 
 
 """
