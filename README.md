@@ -13,7 +13,7 @@ Developed as part of the [SpaceAGORA project](https://github.com/Space-FALCON-La
 
 ## To Do:
 - [x] Get accurate density data from NOAA using Amazon s3 bucket
-- [ ] Figure out how to integrate this within SpaceAGORA 
+- [x] Figure out how to integrate this within SpaceAGORA 
 - [x] Finish writing up Docstrings for Julia to understand
 - [x] Create documentation using `documntation.jl`
 - [x] Register package in Julia General registry.
