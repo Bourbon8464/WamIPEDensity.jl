@@ -1775,12 +1775,4 @@ function plot_global_mean_profile_makie(itp::WAMInterpolator, dt::DateTime;
     return fig, ax, png_path, csv_path
 end
 
-# MODULE INITIALISATION
-
-function __init__()
-    if ccall(:jl_generating_output, Cint, ()) == 0
-        _install_run_timer!()
-    end
-end
-
 end # module
