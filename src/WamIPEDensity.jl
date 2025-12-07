@@ -13,6 +13,9 @@ using URIs
 using DataInterpolations
 using Serialization
 using CommonDataModel
+using Plots
+using CairoMakie 
+using CSV, DataFrames  
 
 const _WIPED_RUN_START_WALL = Ref{DateTime}(DateTime(0))
 const _WIPED_RUN_START_NS   = Ref{Int}(0)
@@ -54,7 +57,8 @@ const DEFAULT_CACHE_DIR = normpath("./cache") # DEFAULT_CACHE_DIR = abspath(join
 const _FILEPAIR_CACHE = Dict{Tuple{String,DateTime}, Tuple{String,String,String,String}}()
 const _FILEPAIR_LOCK  = ReentrantLock()
 
-export WAMInterpolator, get_density, get_density_batch, get_density_at_point, get_density_trajectory, reset_run_timer!
+export WAMInterpolator, get_density, get_density_batch, get_density_at_point, get_density_trajectory, mean_density_profile, plot_global_mean_profile, plot_global_mean_profile_makie
+
 
 """
     WAMInterpolator(; bucket="noaa-nws-wam-ipe-pds", product="wfs", varname="den",
@@ -133,6 +137,198 @@ function _cf_decode!(A::AbstractArray, var)
 
     return B
 end
+
+
+# --- helpers ---
+# Convert the dataset's vertical axis to kilometers (vector form)
+function _z_to_km(z::AbstractVector, ds::NCDataset, zname::String)
+    units = get(ds[zname].attrib, "units", "")
+    kind  = _classify_vertical_units(units)
+    if kind === :km
+        return Float64.(z)
+    elseif kind === :m
+        return Float64.(z) ./ 1000
+    elseif kind === :pressure
+        error("Vertical axis '$zname' uses pressure units ('$units'); cannot convert to altitude (km).")
+    elseif kind === :index || kind === :missing || kind === :unknown
+        error("Unsupported or missing vertical units '$units' on '$zname'. Expected kilometers ('km') or meters ('m').")
+    end
+end
+
+# Mean over lon & lat for every z level (ignores NaN/Fill)
+function _mean_lonlat_over_z(V3::AbstractArray{<:Real,3})
+    @assert ndims(V3) == 3  # lon×lat×z
+    nl, nt, nz = size(V3)
+    out = Vector{Float64}(undef, nz)
+    @inbounds for k in 1:nz
+        acc = 0.0; cnt = 0
+        @views for val in V3[:, :, k]
+            if isfinite(val)
+                acc += val; cnt += 1
+            end
+        end
+        out[k] = cnt == 0 ? NaN : acc / cnt
+    end
+    return out
+end
+
+"""
+    mean_density_profile(itp::WAMInterpolator, dt::DateTime)
+        -> (alt_km::Vector{Float64}, dens_mean::Vector{Float64})
+
+Returns the global-mean neutral density profile at time `dt`, produced by
+averaging across all longitudes and latitudes at each altitude level, with
+linear time interpolation between the two bracketing files.
+"""
+function mean_density_profile(itp::WAMInterpolator, dt::DateTime)
+    # Resolve the two files bracketing dt
+    p_lo, p_hi, _, _ = _get_two_files_exact(itp, dt)
+
+    ds_lo = _open_nc_cached(p_lo)
+    ds_hi = _open_nc_cached(p_hi)
+
+    try
+        # Parse valid times from filenames
+        t_lo = _parse_valid_time_from_key(p_lo)
+        t_hi = _parse_valid_time_from_key(p_hi)
+        t_lo === nothing && (t_lo = t_hi)
+        t_hi === nothing && (t_hi = t_lo)
+
+        # Load grids and values (lon×lat×z×time)
+        latL, lonL, zL, tL, VL, namesL = _load_grids(ds_lo, itp.varname; file_time=t_lo)
+        latH, lonH, zH, tH, VH, namesH = _load_grids(ds_hi, itp.varname; file_time=t_hi)
+
+        # Convert z to km for output/plotting
+        alt_km_L = _z_to_km(zL, ds_lo, namesL[3])
+        alt_km_H = _z_to_km(zH, ds_hi, namesH[3])
+        if !isequal(alt_km_L, alt_km_H)
+            # Simple safeguard: WAM/IPE fixed-height products should match;
+            # if not, we interpolate the high profile onto the low z grid.
+            @warn "Vertical grids differ slightly; interpolating high onto low grid."
+        end
+
+        # For single-time files, VL[:,:,:,1] / VH[:,:,:,1]
+        prof_lo = _mean_lonlat_over_z(@view VL[:, :, :, 1])
+        prof_hi = _mean_lonlat_over_z(@view VH[:, :, :, 1])
+
+        # Temporal blend at query time
+        if t_lo == t_hi
+            return (alt_km_L, prof_lo)
+        else
+            # Linear interpolation in time for each altitude level
+            t0 = Dates.value(t_lo)
+            t1 = Dates.value(t_hi)
+            tq = Dates.value(dt)
+            θ = clamp((tq - t0) / (t1 - t0), 0.0, 1.0)
+
+            # Ensure both profiles align on the same z (assume same grid)
+            if length(prof_lo) != length(prof_hi) || length(alt_km_L) != length(alt_km_H)
+                # If grids mismatch, interpolate prof_hi onto alt_km_L
+                itp_hi = DataInterpolations.LinearInterpolation(prof_hi, alt_km_H)
+                prof_hi = itp_hi.(alt_km_L)
+            end
+
+            prof = @. (1-θ)*prof_lo + θ*prof_hi
+            return (alt_km_L, prof)
+        end
+    finally
+        _unpin_nc_cached(p_lo)
+        _unpin_nc_cached(p_hi)
+    end
+end
+
+"""
+    plot_global_mean_profile(itp::WAMInterpolator, dt::DateTime;
+                             alt_max_km::Real=500, savepath::Union{Nothing,String}=nothing)
+
+Plots the global-mean density profile (density vs altitude, log x-axis).
+Returns the Plots.jl plot object. If `savepath` is given, saves the figure.
+"""
+function plot_global_mean_profile(itp::WAMInterpolator, dt::DateTime;
+                                  alt_max_km::Real=500, savepath::Union{Nothing,String}=nothing)
+    alt_km, dens = mean_density_profile(itp, dt)
+
+    # Clamp/clean for plotting
+    mask = .!(isnan.(dens) .| isinf.(dens))
+    altp = alt_km[mask]
+    denp = dens[mask]
+
+    p = Plots.plot(
+        denp, altp;
+        xscale = :log10,
+        xlabel = "Density, kg/m^3",
+        ylabel = "Altitude, km",
+        legend = false,
+        framestyle = :box,
+        grid = true,  # <-- set grid via attribute (not grid!)
+        title = "Global Mean Density — " * Dates.format(dt, dateformat"yyyy-mm-dd HH:MM 'UTC'")
+    )
+    Plots.ylims!(p, (0, min(alt_max_km, maximum(altp))))
+
+    if savepath !== nothing
+        Plots.savefig(p, String(savepath))
+    end
+    return p
+end
+
+
+
+"""
+    plot_global_mean_profile_makie(itp, dt;
+        alt_max_km::Union{Nothing,Real}=nothing,
+        savepath::AbstractString = "global_mean.png",
+        export_csv::Bool = false,
+        csv_path::Union{Nothing,AbstractString} = nothing)
+
+Makie/CairoMakie version of the global-mean density profile plot.
+- Autoscaling axes by default (like MATLAB). If you want a hard cap on altitude, pass `alt_max_km=<number>`.
+- `export_csv=true` will also write the data to CSV at `csv_path` (or `savepath` with `.csv` extension).
+"""
+function plot_global_mean_profile_makie(itp::WAMInterpolator, dt::DateTime;
+        alt_max_km::Union{Nothing,Real}=nothing,
+        savepath::AbstractString = "global_mean.png",
+        export_csv::Bool = false,
+        csv_path::Union{Nothing,AbstractString} = nothing)
+
+    # compute data
+    alt_km, dens = mean_density_profile(itp, dt)
+
+    # clean & (optionally) clip
+    mask = .!(isnan.(dens) .| isinf.(dens))
+    altp = alt_km[mask]
+    denp = dens[mask]
+
+    if alt_max_km !== nothing
+        clip = altp .<= float(alt_max_km)
+        altp = altp[clip]
+        denp = denp[clip]
+    end
+
+    # optional CSV export
+    if export_csv
+        _csv = csv_path === nothing ? replace(savepath, r"\.[^.]+$" => "") * ".csv" : String(csv_path)
+        CSV.write(_csv, DataFrame(alt_km = altp, density = denp))
+        @info "Wrote CSV" _csv
+    end
+
+    # headless-safe plotting
+    CairoMakie.activate!()  # ensure file backend
+    fig = Figure(resolution = (800, 650))
+    ax = Axis(fig[1,1];
+        xlabel = "Density, kg/m^3",
+        ylabel = "Altitude, km",
+        title  = "Global Mean Density — " * Dates.format(dt, dateformat"yyyy-mm-dd HH:MM 'UTC'"),
+        xscale = log10,         # log x-axis
+        yreversed = false       # natural bottom->top increase
+    )
+
+    lines!(ax, denp, altp)
+    axislegend(ax, visible=false)  # no legend needed
+    fig.savefig(savepath)
+    @info "Saved figure" savepath
+    return fig
+end
+
 
 
 """
