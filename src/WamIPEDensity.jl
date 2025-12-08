@@ -103,7 +103,7 @@ const _DSPOOL = _DSPool(
     Dict{String,NCDataset}(),
     Dict{String,Int}(),
     Dict{String,Int64}(),
-    16,                              # default: keep up to 16 files open
+    50,                           
     ReentrantLock()
 )
 
@@ -1521,27 +1521,28 @@ function get_density_trajectory_optimised(itp::WAMInterpolator,
             tdts_lo, epoch_lo, scale_lo = _decode_time_units(ds_lo, names_lo[4], t_lo_arr)
             tdts_hi, epoch_hi, scale_hi = _decode_time_units(ds_hi, names_hi[4], t_hi_arr)
             
-            # Interpolate all points using this file pair
             mode = _normalise_interp(itp.interpolation)
+
+            tq_lo = (epoch_lo === nothing) ? t_lo : _encode_query_time(t_lo, epoch_lo, scale_lo)
+            tq_hi = (epoch_hi === nothing) ? t_hi : _encode_query_time(t_hi, epoch_hi, scale_hi)
+
+            same_time = (t_lo == t_hi)
+            t_lo_val = same_time ? 0.0 : Float64(Dates.value(t_lo))
+            t_hi_val = same_time ? 0.0 : Float64(Dates.value(t_hi))
+            t_delta_inv = same_time ? 0.0 : 1.0 / (t_hi_val - t_lo_val)
+
             for idx in indices
                 zq_lo = _maybe_convert_alt(z_lo, altkm[idx], ds_lo, names_lo[3])
                 zq_hi = _maybe_convert_alt(z_hi, altkm[idx], ds_hi, names_hi[3])
                 
-                tq_lo = (epoch_lo === nothing) ? t_lo : _encode_query_time(t_lo, epoch_lo, scale_lo)
-                tq_hi = (epoch_hi === nothing) ? t_hi : _encode_query_time(t_hi, epoch_hi, scale_hi)
-                
                 v_lo = _interp4(lat_lo, lon_lo, z_lo, tdts_lo, V_lo, latv[idx], lonv[idx], zq_lo, tq_lo; mode=mode)
                 v_hi = _interp4(lat_hi, lon_hi, z_hi, tdts_hi, V_hi, latv[idx], lonv[idx], zq_hi, tq_hi; mode=mode)
                 
-                # Temporal interpolation
-                if t_lo == t_hi
+                if same_time
                     results[idx] = float(v_lo)
                 else
-                    itp_t = DataInterpolations.LinearInterpolation(
-                        [float(v_lo), float(v_hi)],
-                        [Dates.value(t_lo), Dates.value(t_hi)]
-                    )
-                    results[idx] = itp_t(Dates.value(dts[idx]))
+                    theta_t = (Float64(Dates.value(dts[idx])) - t_lo_val) * t_delta_inv
+                    results[idx] = (1.0 - theta_t) * float(v_lo) + theta_t * float(v_hi)
                 end
             end
         finally
