@@ -23,7 +23,7 @@ using Base: mkpath
 export WAMInterpolator, get_density, get_density_batch, get_density_at_point, 
        get_density_trajectory, get_density_trajectory_optimised, mean_density_profile, 
        plot_global_mean_profile, plot_global_mean_profile_plots,
-       prewarm_cache!, set_max_open_datasets!, print_cache_stats
+       prewarm_cache!, set_max_open_datasets!, print_cache_stats, clear_grid_cache!
 
 # CONSTANTS AND GLOBAL STATE
 
@@ -484,6 +484,42 @@ end
 function _get_cached_filepair(product::String, dt::DateTime)
     lock(_FILEPAIR_LOCK) do
         get(_FILEPAIR_CACHE, (product, _datetime_floor_10min(dt)), nothing)
+    end
+end
+
+# GRID CACHING (AVOID RE-LOADING NETCDF DATA)
+const _GRID_CACHE = Dict{String, Tuple}()
+const _GRID_CACHE_LOCK = ReentrantLock()
+const _MAX_GRID_CACHE_SIZE = 20  # Keep last 20 file grids in RAM
+
+function _get_cached_grids(file_path::String, ds::NCDataset, varname::String, file_time::DateTime)
+    """Get or load grids with caching - avoids reloading same file"""
+    
+    lock(_GRID_CACHE_LOCK) do
+        if haskey(_GRID_CACHE, file_path)
+            return _GRID_CACHE[file_path]
+        end
+        
+        # Load grids (expensive operation - do once per file)
+        grids = _load_grids(ds, varname; file_time=file_time)
+        
+        # Cache it
+        _GRID_CACHE[file_path] = grids
+        
+        # Limit cache size (LRU eviction)
+        if length(_GRID_CACHE) > _MAX_GRID_CACHE_SIZE
+            # Remove first (oldest) entry
+            delete!(_GRID_CACHE, first(keys(_GRID_CACHE)))
+        end
+        
+        return grids
+    end
+end
+
+function clear_grid_cache!()
+    """Clear the grid cache to free memory"""
+    lock(_GRID_CACHE_LOCK) do
+        empty!(_GRID_CACHE)
     end
 end
 
@@ -1319,14 +1355,14 @@ function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real,
 
     try
         lat, lon, z, t, V, (latname, lonname, zname, tname) =
-            _load_grids(ds_lo, itp.varname; file_time=t_lo)
+    _get_cached_grids(p_lo, ds_lo, itp.varname, t_lo)
         tdts, epoch, scale = _decode_time_units(ds_lo, tname, t)
         tq_lo = (epoch === nothing) ? t_lo : _encode_query_time(t_lo, epoch, scale)
         zq_lo = _maybe_convert_alt(z, alt_km, ds_lo, zname)
         v_lo  = _interp4(lat, lon, z, tdts, V, latq, lonq, zq_lo, tq_lo; mode=mode)
 
         lat2, lon2, z2, t2, V2, (latname2, lonname2, zname2, tname2) =
-            _load_grids(ds_hi, itp.varname; file_time=t_hi)
+    _get_cached_grids(p_hi, ds_hi, itp.varname, t_hi)
         tdts2, epoch2, scale2 = _decode_time_units(ds_hi, tname2, t2)
         tq_hi = (epoch2 === nothing) ? t_hi : _encode_query_time(t_hi, epoch2, scale2)
         zq_hi = _maybe_convert_alt(z2, alt_km, ds_hi, zname2)
@@ -1336,12 +1372,12 @@ function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real,
         if t_lo == t_hi
             return float(v_lo)
         else
-            itp_t = DataInterpolations.LinearInterpolation(
-                [float(v_lo), float(v_hi)],
-                [Dates.value(t_lo), Dates.value(t_hi)]
-            )
-            return itp_t(Dates.value(dt))
+            t_lo_val = Float64(Dates.value(t_lo))
+            t_hi_val = Float64(Dates.value(t_hi))
+            theta_t = (Float64(Dates.value(dt)) - t_lo_val) / (t_hi_val - t_lo_val)
+            return (1.0 - theta_t) * float(v_lo) + theta_t * float(v_hi)
         end
+
     finally
         # unpin (keeps files open in pool for reuse)
         _unpin_nc_cached(p_lo)
@@ -1490,9 +1526,26 @@ function get_density_trajectory_optimised(itp::WAMInterpolator,
                                          angles_in_deg::Bool = false)
     
     n = length(dts)
-    latv = angles_in_deg ? Float64.(lats) : rad2deg.(Float64.(lats))
-    lonv = angles_in_deg ? Float64.(lons) : rad2deg.(Float64.(lons))
-    altkm = Float64.(alts_m) .* 1e-3
+
+    # Pre-allocate ALL arrays upfront
+    latv = Vector{Float64}(undef, n)
+    lonv = Vector{Float64}(undef, n)
+    altkm = Vector{Float64}(undef, n)
+
+    # Convert in-place (faster than broadcasting)
+    if angles_in_deg
+        @inbounds @simd for i in 1:n
+            latv[i] = Float64(lats[i])
+            lonv[i] = Float64(lons[i])
+            altkm[i] = Float64(alts_m[i]) * 1e-3
+        end
+    else
+        @inbounds @simd for i in 1:n
+            latv[i] = rad2deg(Float64(lats[i]))
+            lonv[i] = rad2deg(Float64(lons[i]))
+            altkm[i] = Float64(alts_m[i]) * 1e-3
+        end
+    end
     
     # Group queries by which file pair they need
     file_groups = Dict{Tuple{String,String}, Vector{Int}}()
@@ -1514,8 +1567,8 @@ function get_density_trajectory_optimised(itp::WAMInterpolator,
             t_lo = _parse_valid_time_from_key(p_lo)
             t_hi = _parse_valid_time_from_key(p_hi)
             
-            lat_lo, lon_lo, z_lo, t_lo_arr, V_lo, names_lo = _load_grids(ds_lo, itp.varname; file_time=t_lo)
-            lat_hi, lon_hi, z_hi, t_hi_arr, V_hi, names_hi = _load_grids(ds_hi, itp.varname; file_time=t_hi)
+            lat_lo, lon_lo, z_lo, t_lo_arr, V_lo, names_lo = _get_cached_grids(p_lo, ds_lo, itp.varname, t_lo)
+            lat_hi, lon_hi, z_hi, t_hi_arr, V_hi, names_hi = _get_cached_grids(p_hi, ds_hi, itp.varname, t_hi)
             
             tdts_lo, epoch_lo, scale_lo = _decode_time_units(ds_lo, names_lo[4], t_lo_arr)
             tdts_hi, epoch_hi, scale_hi = _decode_time_units(ds_hi, names_hi[4], t_hi_arr)
