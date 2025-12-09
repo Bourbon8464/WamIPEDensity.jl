@@ -288,7 +288,7 @@ object (AWSS3 stream with HTTP fallback), store it atomically, update LRU and
 size accounting, possibly evicting older files. Safe for concurrent threads.
 """
 function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String, key::String;
-                          verbose::Bool=false)
+                          verbose::Bool=true)
     local_path = normpath(joinpath(cache.dir, key))
 
     # fast path: already on disc and recorded
@@ -429,7 +429,7 @@ Returns the local path, atomic and safe for concurrent use.
 function _download_to_cache(aws::AWS.AWSConfig, bucket::String, key::String;
                             cache_dir::AbstractString=DEFAULT_CACHE_DIR,
                             cache_max_bytes::Int=2_000_000_000,
-                            verbose::Bool=false) 
+                            verbose::Bool=true) 
     cache = _get_cache(cache_dir, cache_max_bytes)
     return _cache_get_file!(cache, aws, bucket, key; verbose=verbose)
 end
