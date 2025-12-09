@@ -14,7 +14,6 @@ using DataInterpolations
 using Serialization
 using CommonDataModel
 using Plots
-using CairoMakie 
 using CSV, DataFrames 
 using FilePathsBase: joinpath
 using Base: mkpath
@@ -23,7 +22,7 @@ using Base: mkpath
 
 export WAMInterpolator, get_density, get_density_batch, get_density_at_point, 
        get_density_trajectory, get_density_trajectory_optimised, mean_density_profile, 
-       plot_global_mean_profile, plot_global_mean_profile_makie,
+       plot_global_mean_profile, plot_global_mean_profile_plots,
        prewarm_cache!, set_max_open_datasets!, print_cache_stats
 
 # CONSTANTS AND GLOBAL STATE
@@ -1713,18 +1712,18 @@ function _extend_profile_to_zero(alt_km::AbstractVector{<:Real},
 end
 
 """
-    plot_global_mean_profile_makie(itp, dt;
+    plot_global_mean_profile_plots(itp, dt;
         alt_max_km = nothing,
         extend_to0 = false,
-        savepath   = nothing,     # if provided, overrides auto path for PNG only
+        savepath   = nothing,
         export_csv = false,
-        base_dir   = "plots")     # auto base directory for assets
+        base_dir   = "plots")
 
-Creates (if needed) `plots/<product>/<YYYYMMDDTHHMMSS>/` and saves
-`global_mean_profile.png` (and `.csv` if requested) there.
-Returns `(fig, ax, png_path, csv_path_or_nothing)`.
+Creates plots/<product>/<YYYYMMDDTHHMMSS>/ and saves
+global_mean_profile.png (and .csv if requested) there using Plots.jl.
+Returns (plot_object, png_path, csv_path_or_nothing).
 """
-function plot_global_mean_profile_makie(itp::WAMInterpolator, dt::DateTime;
+function plot_global_mean_profile_plots(itp::WAMInterpolator, dt::DateTime;
     alt_max_km::Union{Nothing,Real}=nothing,
     extend_to0::Bool=false,
     savepath::Union{Nothing,String}=nothing,
@@ -1748,21 +1747,26 @@ function plot_global_mean_profile_makie(itp::WAMInterpolator, dt::DateTime;
     png_path    = savepath === nothing ? default_png : String(savepath)
     csv_path    = export_csv ? joinpath(outdir, "global_mean_profile.csv") : nothing
 
-    CairoMakie.activate!()
-    fig = CairoMakie.Figure(resolution = (800, 600))
-    ax  = CairoMakie.Axis(fig[1,1];
+    # Create plot with Plots.jl
+    p = Plots.plot(
+        denp, altp;
+        xscale = :log10,
         xlabel = "Density (kg·m⁻³)",
         ylabel = "Altitude (km)",
-        xscale = CairoMakie.log10,
-        title  = "Global Mean Density — " * Dates.format(dt, dateformat"yyyy-mm-dd HH:MM 'UTC'")
+        legend = false,
+        framestyle = :box,
+        grid = true,
+        title = "Global Mean Density — " * Dates.format(dt, dateformat"yyyy-mm-dd HH:MM 'UTC'"),
+        linewidth = 2,
+        size = (800, 600),
+        dpi = 150
     )
-    CairoMakie.lines!(ax, denp, altp)
+    
     if alt_max_km !== nothing
-        CairoMakie.ylims!(ax, nothing, float(alt_max_km))
+        Plots.ylims!(p, (0, float(alt_max_km)))
     end
-    CairoMakie.autolimits!(ax)
 
-    CairoMakie.save(png_path, fig)
+    Plots.savefig(p, png_path)
 
     if export_csv
         open(csv_path, "w") do io
@@ -1773,7 +1777,7 @@ function plot_global_mean_profile_makie(itp::WAMInterpolator, dt::DateTime;
         end
     end
 
-    return fig, ax, png_path, csv_path
+    return p, png_path, csv_path
 end
 
 end # module
