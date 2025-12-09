@@ -490,6 +490,8 @@ end
 # GRID CACHING (AVOID RE-LOADING NETCDF DATA)
 const _GRID_CACHE = Dict{String, Tuple}()
 const _GRID_CACHE_LOCK = ReentrantLock()
+const _GRID_360_CACHE = Dict{UInt64, Bool}()
+const _GRID_360_LOCK = ReentrantLock()
 const _MAX_GRID_CACHE_SIZE = 20  # Keep last 20 file grids in RAM
 
 function _get_cached_grids(file_path::String, ds::NCDataset, varname::String, file_time::DateTime)
@@ -557,7 +559,7 @@ _model_for_version(v::String) = v == "v1.2" ? "wam10" :
 
 Floor `dt` to the nearest 10-minute boundary.
 """
-function _datetime_floor_10min(dt::DateTime)
+@inline function _datetime_floor_10min(dt::DateTime)
     m  = minute(dt)
     mm = m - (m % 10)
     DateTime(Date(dt), Time(hour(dt), mm))
@@ -1090,10 +1092,21 @@ end
 # GRID UTILITIES (LONGITUDE WRAPPING)
 
 # Decide grid convention quickly: if any lon > 180, treat as [0, 360); else assume [-180, 180]
-_grid_uses_360(lon::AbstractVector) = maximum(lon) > 180
+
+@inline function _grid_uses_360(lon::AbstractVector)
+    h = hash(lon)
+    lock(_GRID_360_LOCK) do
+        if haskey(_GRID_360_CACHE, h)
+            return _GRID_360_CACHE[h]
+        end
+        result = maximum(lon) > 180
+        _GRID_360_CACHE[h] = result
+        return result
+    end
+end
 
 # Wrap lonq to match the grid's convention
-function _wrap_lon_for_grid(lon_grid::AbstractVector, lonq::Real)
+@inline function _wrap_lon_for_grid(lon_grid::AbstractVector, lonq::Real)
     if _grid_uses_360(lon_grid)
         return lonq < 0 ? lonq + 360 : lonq
     else
@@ -1102,13 +1115,13 @@ function _wrap_lon_for_grid(lon_grid::AbstractVector, lonq::Real)
 end
 
 # Find nearest indices
-_nearest_index(vec::AbstractVector, x::Real) = findmin(abs.(vec .- x))[2]
+@inline _nearest_index(vec::AbstractVector, x::Real) = findmin(abs.(vec .- x))[2]
 
 # INTERPOLATION FUNCTIONS
 
 # 3-D separable linear interpolation over (lon, lat, z) for a single time slice
-function _interp3_linear(lat::AbstractVector, lon::AbstractVector, z::AbstractVector,
-                         Vt::AbstractArray{<:Real,3}, latq::Real, lonq::Real, zq::Real)
+@inline function _interp3_linear(lat::AbstractVector, lon::AbstractVector, z::AbstractVector,
+                         Vt::AbstractArray{<:Real,3}, latq::Real, lonq::Real, zq::Real)::Float64
 
     lonq2 = _wrap_lon_for_grid(lon, lonq)
 
@@ -1146,7 +1159,7 @@ function _interp3_linear(lat::AbstractVector, lon::AbstractVector, z::AbstractVe
 end
 
 # 3-D separable linear interpolation where the vertical step is done in log-space
-function _interp3_logz_linear(lat::AbstractVector, lon::AbstractVector, z::AbstractVector,
+@inline function _interp3_logz_linear(lat::AbstractVector, lon::AbstractVector, z::AbstractVector,
                               Vt::AbstractArray{<:Real,3}, latq::Real, lonq::Real, zq::Real)
 
     lonq2 = _wrap_lon_for_grid(lon, lonq)
@@ -1189,7 +1202,7 @@ function _interp3_logz_linear(lat::AbstractVector, lon::AbstractVector, z::Abstr
     return (1-theta_lon)*Vphi[ilon] + theta_lon*Vphi[ilon+1]
 end
 
-function _bilinear_lonlat(lat::AbstractVector, lon::AbstractVector,
+@inline function _bilinear_lonlat(lat::AbstractVector, lon::AbstractVector,
                           grid::AbstractArray{<:Real,2}, latq::Real, lonq::Real)
     lonq2 = _wrap_lon_for_grid(lon, lonq)
 
@@ -1233,8 +1246,8 @@ function _sciml_quad_logz(z::AbstractVector, v::AbstractVector, zq::Real)
 end
 
 # Bilinear in lon/lat at each z-level, then quadratic in log(z)-log(v) across all levels
-function _interp3_bilin_then_quadlogz(lat::AbstractVector, lon::AbstractVector, z::AbstractVector,
-                                      Vt::AbstractArray{<:Real,3}, latq::Real, lonq::Real, zq::Real)
+@inline function _interp3_bilin_then_quadlogz(lat::AbstractVector, lon::AbstractVector, z::AbstractVector,
+                                      Vt::AbstractArray{<:Real,3}, latq::Real, lonq::Real, zq::Real)::Float64
 
     # Build v(z_k) = bilinear lon/lat value at each level
     v_at_levels = Vector{Float64}(undef, length(z))
@@ -1245,7 +1258,7 @@ function _interp3_bilin_then_quadlogz(lat::AbstractVector, lon::AbstractVector, 
 end
 
 # Interpolate in lon-lat-z-time (nearest / linear / logz_linear / logz_quadratic)
-function _interp4(lat, lon, z, t, V, latq, lonq, zq, tq; mode::Symbol=:nearest)
+@inline function _interp4(lat, lon, z, t, V, latq, lonq, zq, tq; mode::Symbol=:nearest)
     lonq2 = _wrap_lon_for_grid(lon, lonq)
 
     # Single-time case
@@ -1310,7 +1323,7 @@ end
 # VALIDATION AND NORMALISATION
 
 # Treat :sciml as an alias of :logz_quadratic
-_normalise_interp(s::Symbol) = (s === :sciml ? :logz_quadratic : s)
+@inline _normalise_interp(s::Symbol) = (s === :sciml ? :logz_quadratic : s)
 
 function _validate_query_args(interp::Symbol, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)::Symbol
     mode = _normalise_interp(interp)
