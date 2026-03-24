@@ -17,12 +17,15 @@ using Plots
 using CSV, DataFrames 
 using FilePathsBase: joinpath
 using Base: mkpath
+using Downloads
 
 # EXPORTS
 
-export WAMInterpolator, get_density, get_density_batch, get_density_at_point, 
-       get_density_trajectory, get_density_trajectory_optimised, mean_density_profile, 
-       plot_global_mean_profile, plot_global_mean_profile_plots,
+export WAMInterpolator, GEOSInterpolator,
+       get_density, get_density_geos, get_density_hybrid,
+       get_density_batch, get_density_at_point,
+       get_density_trajectory, get_density_trajectory_optimised,
+       mean_density_profile, plot_global_mean_profile, plot_global_mean_profile_plots,
        prewarm_cache!, set_max_open_datasets!, print_cache_stats, clear_grid_cache!
 
 # CONSTANTS AND GLOBAL STATE
@@ -74,6 +77,214 @@ Base.@kwdef struct WAMInterpolator
     varname::String = "den"
     region::String = "us-east-1"
     interpolation::Symbol = :sciml
+end
+
+# GEOS CONFIGURATION
+
+"""
+    GEOSInterpolator(; cache_dir=normpath("./cache/geos"), interpolation=:nearest,
+                       geos_alt_max_km=80.0)
+
+Configuration object for accessing NASA GEOS FP model-level files and computing
+density from T, QV, PL, and H.
+
+- `cache_dir`: local directory for downloaded GEOS files
+- `interpolation`: currently `:nearest` only for horizontal lookup
+- `geos_alt_max_km`: upper altitude limit to use GEOS in hybrid mode
+"""
+Base.@kwdef struct GEOSInterpolator
+    cache_dir::String = normpath("./cache/geos")
+    interpolation::Symbol = :nearest
+    geos_alt_max_km::Float64 = 80.0
+end
+
+const _GEOS_BASE_URL = "https://portal.nccs.nasa.gov/datashare/gmao_ops/pub/fp/das"
+const _R_D = 287.05  # J/(kg K)
+
+@inline function _geos_normalize_lon_360(lon::Real)
+    x = Float64(lon)
+    while x < 0.0
+        x += 360.0
+    end
+    while x >= 360.0
+        x -= 360.0
+    end
+    return x
+end
+
+"""
+    _geos_snap_dt(dt) -> DateTime
+
+GEOS FP 3D assimilation files are 3-hourly instantaneous products.
+Snap to the previous synoptic time: 00, 03, 06, ..., 21 UTC.
+"""
+function _geos_snap_dt(dt::DateTime)
+    h = 3 * (Dates.hour(dt) ÷ 3)
+    return DateTime(Dates.year(dt), Dates.month(dt), Dates.day(dt), h)
+end
+
+"""
+    _geos_build_relpath(dt) -> String
+
+Build relative path under the NCCS portal for GEOS FP `inst3_3d_asm_Nv`.
+"""
+function _geos_build_relpath(dt::DateTime)
+    dts = _geos_snap_dt(dt)
+    yyyy = @sprintf("%04d", Dates.year(dts))
+    mm   = @sprintf("%02d", Dates.month(dts))
+    dd   = @sprintf("%02d", Dates.day(dts))
+    hh   = @sprintf("%02d", Dates.hour(dts))
+
+    return "Y$(yyyy)/M$(mm)/D$(dd)/GEOS.fp.asm.inst3_3d_asm_Nv.$(yyyy)$(mm)$(dd)_$(hh)00.V01.nc4"
+end
+
+"""
+    _geos_url(dt) -> String
+"""
+_geos_url(dt::DateTime) = string(_GEOS_BASE_URL, "/", _geos_build_relpath(dt))
+
+"""
+    _geos_local_path(itp, dt) -> String
+"""
+function _geos_local_path(itp::GEOSInterpolator, dt::DateTime)
+    dts = _geos_snap_dt(dt)
+    yyyy = @sprintf("%04d", Dates.year(dts))
+    mm   = @sprintf("%02d", Dates.month(dts))
+    dd   = @sprintf("%02d", Dates.day(dts))
+    mkpath(joinpath(itp.cache_dir, "Y$(yyyy)", "M$(mm)", "D$(dd)"))
+    return joinpath(itp.cache_dir, "Y$(yyyy)", "M$(mm)", "D$(dd)", basename(_geos_build_relpath(dt)))
+end
+
+"""
+    _download_geos_file(itp, dt) -> String
+
+Download a GEOS FP file if missing.
+"""
+function _download_geos_file(itp::GEOSInterpolator, dt::DateTime)
+    local_path = _geos_local_path(itp, dt)
+    if isfile(local_path)
+        return local_path
+    end
+
+    url = _geos_url(dt)
+    try
+        Downloads.download(url, local_path)
+    catch err
+        isfile(local_path) && rm(local_path; force=true)
+        error("Failed to download GEOS file from $url\nOriginal error: $err")
+    end
+    return local_path
+end
+
+"""
+    _var_dimnames(v) -> Tuple{Vararg{String}}
+
+Robustly get variable dimension names from NCDatasets.
+"""
+function _var_dimnames(v)
+    try
+        return Tuple(String.(dimnames(v)))
+    catch
+        try
+            return Tuple(String.(keys(v.dim)))
+        catch err
+            error("Could not determine NetCDF dimension names for variable $(name(v)). Error: $err")
+        end
+    end
+end
+
+"""
+    _read_var_tzyx(ds, name) -> Array{Float64,4}
+
+Read a GEOS variable and reorder dimensions to:
+(time, lev, lat, lon)
+
+This makes the code robust to the file's native dim ordering.
+"""
+function _read_var_tzyx(ds::NCDataset, name::String)
+    haskey(ds, name) || error("Variable '$name' not found in GEOS file.")
+    v = ds[name]
+    A = Array(v[:])
+    dims = _var_dimnames(v)
+
+    required = ("time", "lev", "lat", "lon")
+    all(d -> d in dims, required) || error("Variable '$name' dims are $dims but expected to contain $required")
+
+    perm = ntuple(i -> findfirst(==(required[i]), dims), 4)
+    return Float64.(permutedims(A, perm))
+end
+
+"""
+    _geos_profile_nearest(ds, latq, lonq)
+
+Return vertical profiles of z [m], rho [kg/m^3] at nearest lat/lon point.
+"""
+function _geos_profile_nearest(ds::NCDataset, latq::Real, lonq::Real)
+    haskey(ds, "lat") || error("GEOS file missing coordinate variable 'lat'")
+    haskey(ds, "lon") || error("GEOS file missing coordinate variable 'lon'")
+
+    lat = Float64.(vec(ds["lat"][:]))
+    lon = Float64.(vec(ds["lon"][:]))
+    lonq360 = _geos_normalize_lon_360(lonq)
+
+    ilat = _nearest_index(lat, latq)
+    ilon = _nearest_index(lon, lonq360)
+
+    H  = _read_var_tzyx(ds, "H")
+    PL = _read_var_tzyx(ds, "PL")
+    QV = _read_var_tzyx(ds, "QV")
+    T  = _read_var_tzyx(ds, "T")
+
+    # first/only time slice
+    zprof = vec(H[1, :, ilat, ilon])
+    pprof = vec(PL[1, :, ilat, ilon])
+    qprof = vec(QV[1, :, ilat, ilon])
+    Tprof = vec(T[1, :, ilat, ilon])
+
+    Tv   = Tprof .* (1 .+ 0.61 .* qprof)
+    rho  = pprof ./ (_R_D .* Tv)
+
+    return zprof, rho
+end
+
+"""
+    _interp_profile_zrho(zprof, rprof, alt_km) -> Float64
+
+Vertical interpolation in altitude.
+"""
+function _interp_profile_zrho(zprof::AbstractVector, rprof::AbstractVector, alt_km::Real)
+    zq = 1000.0 * Float64(alt_km)
+
+    mask = .!(isnan.(zprof) .| isnan.(rprof) .| isinf.(zprof) .| isinf.(rprof))
+    z = Float64.(zprof[mask])
+    r = Float64.(rprof[mask])
+
+    isempty(z) && error("GEOS profile is empty after filtering invalid values.")
+
+    p = sortperm(z)
+    z = z[p]
+    r = r[p]
+
+    # remove duplicate z levels if any
+    zuniq = Float64[]
+    runiq = Float64[]
+    lastz = nothing
+    for i in eachindex(z)
+        if lastz === nothing || z[i] != lastz
+            push!(zuniq, z[i])
+            push!(runiq, r[i])
+            lastz = z[i]
+        end
+    end
+
+    length(zuniq) >= 2 || error("Not enough unique vertical levels in GEOS profile to interpolate.")
+
+    if zq < first(zuniq) || zq > last(zuniq)
+        error("Requested altitude $(alt_km) km is outside GEOS height range $(first(zuniq)/1000) to $(last(zuniq)/1000) km")
+    end
+
+    itp = linear_interpolation(zuniq, runiq, extrapolation_bc=Throw())
+    return itp(zq)
 end
 
 # AWS CONFIGURATION
@@ -763,10 +974,16 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
             end
         end
         local function _resolve_wrs_stamp(dt_file::DateTime)
-            arch_00 = DateTime(Date(dt_file), Time(0))
-            arch_18 = DateTime(Date(dt_file) - Day(1), Time(18))
-            (p00 = _try_wrs_from_cycle(dt_file, arch_00)) !== nothing && return (p00, "wrs")
-            (p18 = _try_wrs_from_cycle(dt_file, arch_18)) !== nothing && return (p18, "wrs")
+            arch_primary = _wrs_archive(dt_file)
+            (p = _try_wrs_from_cycle(dt_file, arch_primary)) !== nothing && return (p, "wrs")
+
+            # fallback: adjacent cycles in case of gaps
+            arch_prev = arch_primary - Hour(6)
+            (p = _try_wrs_from_cycle(dt_file, arch_prev)) !== nothing && return (p, "wrs")
+
+            arch_next = arch_primary + Hour(6)
+            (p = _try_wrs_from_cycle(dt_file, arch_next)) !== nothing && return (p, "wrs")
+
             return (nothing, "wrs")
         end
 
@@ -1398,6 +1615,9 @@ function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real,
     end
 end
 
+
+
+
 """
     get_density_batch(itp, dts, lats, lons, alts_km) -> Vector{Float64}
 
@@ -1845,5 +2065,56 @@ function plot_global_mean_profile_plots(itp::WAMInterpolator, dt::DateTime;
 
     return p, png_path, csv_path
 end
+
+"""
+    get_density_geos(itp::GEOSInterpolator, dt::DateTime, lat::Real, lon::Real, alt_km::Real)
+
+Return density at (`dt`, `lat`, `lon`, `alt_km`) using NASA GEOS FP
+`inst3_3d_asm_Nv` model-level fields.
+"""
+function get_density_geos(itp::GEOSInterpolator, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
+    isfinite(latq) && -90.0 <= latq <= 90.0 ||
+        throw(ArgumentError("lat must be finite and in [-90, 90]; got $latq"))
+    isfinite(lonq) || throw(ArgumentError("lon must be finite; got $lonq"))
+    isfinite(alt_km) || throw(ArgumentError("alt_km must be finite; got $alt_km"))
+    alt_km >= 0 || throw(ArgumentError("alt_km must be >= 0; got $alt_km"))
+
+    local_path = _download_geos_file(itp, dt)
+
+    ds = _open_nc_cached(local_path)
+    try
+        zprof, rprof = _geos_profile_nearest(ds, latq, lonq)
+        return _interp_profile_zrho(zprof, rprof, alt_km)
+    finally
+        _unpin_nc_cached(local_path)
+    end
+end
+
+"""
+    get_density(itp::GEOSInterpolator, dt::DateTime, lat::Real, lon::Real, alt_km::Real)
+
+Dispatch GEOS queries through the same public API name as WAM.
+"""
+function get_density(itp::GEOSInterpolator, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
+    return get_density_geos(itp, dt, latq, lonq, alt_km)
+end
+
+"""
+    get_density_hybrid(wam::WAMInterpolator, geos::GEOSInterpolator,
+                       dt::DateTime, lat::Real, lon::Real, alt_km::Real)
+
+Use GEOS below `geos.geos_alt_max_km` and WAM-IPE above it.
+"""
+function get_density_hybrid(wam::WAMInterpolator, geos::GEOSInterpolator,
+                            dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
+    if alt_km <= geos.geos_alt_max_km
+        return get_density(geos, dt, latq, lonq, alt_km)
+    else
+        return get_density(wam, dt, latq, lonq, alt_km)
+    end
+end
+
+
+
 
 end # module
