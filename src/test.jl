@@ -64,18 +64,6 @@ const _CACHE_META_FILE = "metadata.bin"
 
 # MAIN DATA STRUCTURE
 
-"""
-    WAMInterpolator(; bucket="noaa-nws-wam-ipe-pds", product="wfs", varname="den",
-                      region="us-east-1", interpolation=:sciml)
-
-Configuration object for accessing and interpolating WAM-IPE data on S3.
-
-- `bucket`: S3 bucket name (public). Default: `"noaa-nws-wam-ipe-pds"`.
-- `product::String` — Product subfolder prefix, typically `"wfs"` (forecast) or `"wrs"` (Real-time Nowcast).
-- `varname`: NetCDF variable name for neutral density (set to your target; defaults `"den"`)
-- `region`: AWS region (WAM-IPE public data is in `us-east-1`)
-- `interpolation`: `:nearest`, `:linear`, `:logz_linear`, `:logz_quadratic` or `:sciml`
-"""
 Base.@kwdef struct WAMInterpolator
     bucket::String = "noaa-nws-wam-ipe-pds"
     root_prefix::String = "v1.2" # S3 root prefix for WAM-IPE data
@@ -120,12 +108,7 @@ end
 
 # AWS CONFIGURATION
 
-"""
-    _aws_cfg(region) returns AWS.AWSConfig
 
-Create an unsigned AWS config for `region`.
-This avoids credential requirements for public WAM-IPE objects.
-"""
 function _aws_cfg(region::String)
     AWS.AWSConfig(; region=region, creds=nothing)
 end
@@ -224,21 +207,11 @@ end
 # Cache instances keyed by (dir, max_bytes)
 const _CACHES = Dict{Tuple{String,Int64}, _FileCache}()
 
-"""
-    _cache_meta_path(dir) returns String
 
-Returns the path of the cache metadata file in `dir`.
-"""
 function _cache_meta_path(dir::AbstractString)
     joinpath(dir, _CACHE_META_FILE)
 end
 
-"""
-    _load_cache(dir, max_bytes) returns _FileCache
-
-Load/initialises the on-disc cache metadata for `dir`. This is tolerant of
-corrupt/old metadata and recreates missing fields.
-"""
 function _load_cache(dir::AbstractString, max_bytes::Int64)
     mkpath(dir)
     meta = _cache_meta_path(dir)
@@ -270,11 +243,7 @@ function _load_cache(dir::AbstractString, max_bytes::Int64)
     )
 end
 
-"""
-    _save_cache(cache) returns Nothing
 
-Persist cache metadata to disc.
-"""
 function _save_cache(cache::_FileCache)
     mkpath(cache.dir)
     open(_cache_meta_path(cache.dir), "w") do io
@@ -283,11 +252,6 @@ function _save_cache(cache::_FileCache)
     return nothing
 end
 
-"""
-    _lru_touch!(cache, key)
-
-Mark `key` as most-recently-used in `cache`.
-"""
 function _lru_touch!(cache::_FileCache, key::String)
     # remove if present
     idx = findfirst(==(key), cache.order)
@@ -297,12 +261,7 @@ function _lru_touch!(cache::_FileCache, key::String)
     push!(cache.order, key)
 end
 
-"""
-    _evict_until_under_budget!(cache)
 
-Deletes least-recently-used files from disc until the cache fits within
-`cache.max_bytes`.
-"""
 function _evict_until_under_budget!(cache::_FileCache)
     while cache.bytes > cache.max_bytes && !isempty(cache.order)
         victim = first(cache.order)
@@ -322,13 +281,6 @@ function _evict_until_under_budget!(cache::_FileCache)
     end
 end
 
-"""
-    _cache_get_file!(cache, aws, bucket, key; verbose=true) returns String
-
-Core cache routine. If present, return the cached path. Otherwise download the
-object (AWSS3 stream with HTTP fallback), store it atomically, update LRU and
-size accounting, possibly evicting older files. Safe for concurrent threads.
-"""
 function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String, key::String;
                           verbose::Bool=true)
     local_path = normpath(joinpath(cache.dir, key))
@@ -437,11 +389,6 @@ function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String,
     end
 end
 
-"""
-    _get_cache(cache_dir, max_bytes) returns _FileCache
-
-Gets/creates the shared cache object for `(cache_dir, max_bytes)`.
-"""
 function _get_cache(cache_dir::AbstractString, max_bytes::Int64)
     key = (String(cache_dir), Int64(max_bytes))
     if haskey(_CACHES, key)
@@ -452,22 +399,11 @@ function _get_cache(cache_dir::AbstractString, max_bytes::Int64)
     end
 end
 
-"""
-    _cache_path(cache_dir, key) returns String
 
-Joins `cache_dir` and S3 `key` using a normalised path whilst keeping the
-remote directory structure (e.g. `v1.2/wfs...`).
-"""
 _cache_path(cache_dir::AbstractString, key::AbstractString) =   
     normpath(joinpath(cache_dir, key))  # preserves v1.2/…/… structure
 
-"""
-    _download_to_cache(aws, bucket, key; cache_dir=DEFAULT_CACHE_DIR,
-                       cache_max_bytes=2_000_000_000, verbose=true) returns String
 
-Download `key` into an on-disc, thread-safe LRU cache rooted at `cache_dir`.
-Returns the local path, atomic and safe for concurrent use.
-"""
 function _download_to_cache(aws::AWS.AWSConfig, bucket::String, key::String;
                             cache_dir::AbstractString=DEFAULT_CACHE_DIR,
                             cache_max_bytes::Int=2_000_000_000,
@@ -476,12 +412,6 @@ function _download_to_cache(aws::AWS.AWSConfig, bucket::String, key::String;
     return _cache_get_file!(cache, aws, bucket, key; verbose=verbose)
 end
 
-"""
-    _open_nc_from_s3(aws, bucket, key; cache_dir=DEFAULT_CACHE_DIR)
-
-Opens the NetCDF from local cache if present, otherwise downloads from S3 into cache.
-Returns `(ds, path)`; Caller must `close(ds)` when done. The cache file is kept for reuse.
-"""
 function _open_nc_from_s3(aws::AWS.AWSConfig, bucket::String, key::String;
                           cache_dir::AbstractString=DEFAULT_CACHE_DIR,
                           cache_max_bytes::Int=2_000_000_000)
@@ -492,11 +422,7 @@ function _open_nc_from_s3(aws::AWS.AWSConfig, bucket::String, key::String;
     return NCDataset(local_path, "r"), local_path
 end
 
-"""
-    _geos_local_path(itp, dt) returns String
 
-Build a deterministic local cache path for a GEOS-FP file.
-"""
 function _geos_local_path(itp::GEOSFPInterpolator, dt::DateTime)
     yyyy = Dates.format(Date(dt), dateformat"yyyy")
     mm   = Dates.format(Date(dt), dateformat"mm")
@@ -510,11 +436,6 @@ function _geos_local_path(itp::GEOSFPInterpolator, dt::DateTime)
                     "GEOSFP_" * itp.collection * "_" * yyyy * mm * dd * "_" * hh * "00.nc4")
 end
 
-"""
-    _geos_build_url(itp, dt) returns String
-
-Build the remote URL for a GEOS-FP file.
-"""
 
 function _geos_build_url(itp::GEOSFPInterpolator, dt::DateTime)
     yyyy = Dates.format(Date(dt), dateformat"yyyy")
@@ -533,12 +454,7 @@ function _geos_build_url(itp::GEOSFPInterpolator, dt::DateTime)
     )
 end
 
-"""
-    _geos_download_to_cache(itp, dt; verbose=true) returns String
 
-Download a GEOS-FP NetCDF file into the GEOS local cache and return its path.
-If the file already exists locally, reuse it.
-"""
 function _geos_download_to_cache(itp::GEOSFPInterpolator, dt::DateTime; verbose::Bool=true)
     local_path = _geos_local_path(itp, dt)
     isfile(local_path) && return local_path
@@ -573,12 +489,6 @@ function _geos_download_to_cache(itp::GEOSFPInterpolator, dt::DateTime; verbose:
     end
 end
 
-"""
-    print_cache_stats(; cache_dir=DEFAULT_CACHE_DIR, cache_max_bytes=2_000_000_000)
-
-Prints the current cache directory, capacity, usage, and LRU/MRU keys.
-Useful for debugging what is stored on disc.
-"""
 function print_cache_stats(; cache_dir::AbstractString=DEFAULT_CACHE_DIR, cache_max_bytes::Int=2_000_000_000)
     cache = _get_cache(cache_dir, cache_max_bytes)
     lock(cache.lock) do
@@ -617,9 +527,7 @@ const _GRID_360_CACHE = Dict{UInt64, Bool}()
 const _GRID_360_LOCK = ReentrantLock()
 const _MAX_GRID_CACHE_SIZE = 20  # Keep last 20 file grids in RAM
 
-function _get_cached_grids(file_path::String, ds::NCDataset, varname::String, file_time::DateTime)
-    """Get or load grids with caching - avoids reloading same file"""
-    
+function _get_cached_grids(file_path::String, ds::NCDataset, varname::String, file_time::DateTime)    
     lock(_GRID_CACHE_LOCK) do
         if haskey(_GRID_CACHE, file_path)
             return _GRID_CACHE[file_path]
@@ -642,7 +550,6 @@ function _get_cached_grids(file_path::String, ds::NCDataset, varname::String, fi
 end
 
 function clear_grid_cache!()
-    """Clear the grid cache to free memory"""
     lock(_GRID_CACHE_LOCK) do
         empty!(_GRID_CACHE)
     end
@@ -650,12 +557,7 @@ end
 
 # VERSION AND MODEL MAPPING
 
-"""
-    _version_for(dt) returns String
 
-Returns the S3 version root (e.g. `"v1.2"`) that applies to `dt` based on
-internal date windows.
-"""
 function _version_for(dt::DateTime)::String
     for (v, lo, hi) in _VERSION_WINDOWS
         if dt >= lo && (hi === nothing || dt <= hi)
@@ -665,23 +567,14 @@ function _version_for(dt::DateTime)::String
     error("No WAM-IPE version mapping covers $dt")
 end
 
-"""
-    _model_for_version(v) returns String
 
-Map a version root (e.g. `"v1.1"`, `"v1.2"`) to its model token used in filenames
-(e.g. `"wam10"`, `"gsm10"`).
-"""
 _model_for_version(v::String) = v == "v1.2" ? "wam10" :
                                 v == "v1.1" ? "gsm10" :
                                 error("Unknown version $v")
 
 # DATE/TIME UTILITIES
 
-"""
-    _datetime_floor_10min(dt) returns DateTime
 
-Floor `dt` to the nearest 10-minute boundary.
-"""
 @inline function _datetime_floor_10min(dt::DateTime)
     m  = minute(dt)
     mm = m - (m % 10)
@@ -691,34 +584,20 @@ end
 _surrounding_10min(dt::DateTime) = (_datetime_floor_10min(dt),
                                     _datetime_floor_10min(dt) + Minute(10))
 
-"""
-    _datetime_floor_3hr(dt) returns DateTime
 
-Floor `dt` to the nearest 3-hour boundary.
-"""
 @inline function _datetime_floor_3hr(dt::DateTime)
     hh = hour(dt) - (hour(dt) % 3)
     return DateTime(Date(dt), Time(hh))
 end
 
-"""
-    _geos_surrounding_times(dt) returns (DateTime, DateTime)
 
-Return the two 3-hour GEOS-FP times bracketing `dt`.
-If `dt` lands exactly on a 3-hour boundary, both returned times are the same.
-"""
 function _geos_surrounding_times(dt::DateTime)
     t_lo = _datetime_floor_3hr(dt)
     t_hi = t_lo == dt ? t_lo : t_lo + Hour(3)
     return t_lo, t_hi
 end
 
-"""
-    _wrs_archive(dt) returns DateTime
 
-Select the cycle hour for the WRS product that should contain `dt`.
-This controls which S3 folder (…/HH/) to search.
-"""
 function _wrs_archive(dt::DateTime)::DateTime
     h = hour(dt)
     if h < 3
@@ -734,12 +613,7 @@ function _wrs_archive(dt::DateTime)::DateTime
     end
 end
 
-"""
-    _wfs_archive(dt) returns DateTime
 
-Select the cycle hour for the WFS product that should contain `dt`.
-This controls which S3 folder (…/HH/) to search.
-"""
 function _wfs_archive(dt::DateTime)::DateTime
     h = hour(dt)
     if h < 3
@@ -755,11 +629,7 @@ function _wfs_archive(dt::DateTime)::DateTime
     end
 end
 
-"""
-    _parse_valid_time_from_key(key) returns Union{DateTime,Nothing}
 
-Parse ...YYYYMMDD_HHMMSS.nc at the end of the key
-"""
 _parse_valid_time_from_key(key::AbstractString) = let m = match(r"(\d{8})_(\d{6})\.nc$", key)
     m === nothing && return nothing
     ymd, hms = m.captures
@@ -811,13 +681,6 @@ end
 
 # S3 KEY CONSTRUCTION AND FILE RESOLUTION
 
-"""
-    _construct_s3_key(dt, product) returns String
-
-Build the exact S3 key for a given 10-minute stamp `dt` and `product`
-(`"wfs"` or `"wrs"`). The filename encodes `dt`, whilst the folder encodes the
-chosen cycle hour.
-"""
 function _construct_s3_key(dt::DateTime, product::String)::String
     v       = _version_for(dt)
     model   = _model_for_version(v)
@@ -858,13 +721,7 @@ end
     isfile(p1) && isfile(p2)
 end
 
-"""
-    _get_two_files_exact(itp, dt) returns (low_path, high_path, low_product, high_product)
 
-Resolve and fetch the two local files that bracket the 10-minute stamp `dt`.
-Prefers the configured product, but will fall back to the alternate product if
-necessary. Throws if either side cannot be found.
-"""
 function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     # RAM cache check (per product, per floored 10-min bucket)
     if (cached = _get_cached_filepair(itp.product, dt)) !== nothing
@@ -960,13 +817,6 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
     return (p_lo_path, p_hi_path, prod_lo_used, prod_hi_used)
 end
 
-"""
-    _try_download(itp, dt, product) returns Union{String,Nothing}
-
-Attempt to download a single NetCDF corresponding to an exact 10-minute
-stamp `dt` under `product` (e.g. `"wfs"`). Returns local path on success,
-`nothing` on failure.
-"""
 function _try_download(itp::WAMInterpolator, dt::DateTime, product::String)
     aws = _aws_cfg(itp.region)
     key = _construct_s3_key(dt, product)
@@ -982,11 +832,6 @@ function _try_download(itp::WAMInterpolator, dt::DateTime, product::String)
     end
 end
 
-"""
-    _geos_get_two_files_exact(itp, dt) returns (low_path, high_path, low_dt, high_dt)
-
-Resolve and cache the two GEOS-FP files bracketing `dt`.
-"""
 function _geos_get_two_files_exact(itp::GEOSFPInterpolator, dt::DateTime)
     dt_lo, dt_hi = _geos_surrounding_times(dt)
     p_lo = _geos_download_to_cache(itp, dt_lo; verbose=false)
@@ -1080,13 +925,6 @@ function _cf_decode!(A::AbstractArray, var)
     return B
 end
 
-"""
-    _classify_vertical_units(units_raw) returns Symbol
-
-Classify vertical coordinate, heuristically, units into one of
-`:km`, `:m`, `:pressure`, `:index`, `:missing`, or `:unknown`.
-Used to validate/convert altitude queries.
-"""
 function _classify_vertical_units(units_raw::AbstractString)
     s = lowercase(strip(String(units_raw)))
     isempty(s) && return :missing
@@ -1276,16 +1114,6 @@ function _z_to_km(z::AbstractVector, ds::NCDataset, zname::String)
     end
 end
 
-# =========================
-# GEOS-FP NETCDF LOAD HELPERS
-# =========================
-
-"""
-    _geos_classify_dim(dname, ds) returns Symbol
-
-Classify a GEOS-FP variable dimension as one of:
-:lon, :lat, :z, :time, or :unknown
-"""
 function _geos_classify_dim(dname::String, ds::NCDataset)
     lname = lowercase(dname)
     var   = haskey(ds, dname) ? ds[dname] : nothing
@@ -1362,32 +1190,18 @@ function _geos_dim_indices(ds::NCDataset, varname::String)
     return idx_lon, idx_lat, idx_z, idx_time, dnames
 end
 
-"""
-    _geos_permute4(A, idx_lon, idx_lat, idx_z, idx_time)
 
-Permute a 4-D array into your internal convention:
-(lon, lat, z, time)
-"""
 function _geos_permute4(A::AbstractArray, idx_lon::Int, idx_lat::Int, idx_z::Int, idx_time::Int)
     perm = (idx_lon, idx_lat, idx_z, idx_time)
     return perm == (1,2,3,4) ? Array(A) : Array(PermutedDimsArray(A, perm))
 end
 
-"""
-    _geos_coord_vector(ds, dname, fallback_len)
 
-Load a coordinate vector or fall back to 1:fallback_len.
-"""
 function _geos_coord_vector(ds::NCDataset, dname::String, fallback_len::Int)
     return haskey(ds, dname) ? collect(ds[dname][:]) : collect(1:fallback_len)
 end
 
-"""
-    _geos_level_pressure_pa(ds, itp)
 
-Return the pressure-level coordinate in Pa.
-Your inspected file shows `lev` is in hPa.
-"""
 function _geos_level_pressure_pa(ds::NCDataset, itp::GEOSFPInterpolator)
     haskey(ds, itp.lev_varname) || error("GEOS file missing level coordinate '$(itp.lev_varname)'")
 
@@ -1406,12 +1220,7 @@ function _geos_level_pressure_pa(ds::NCDataset, itp::GEOSFPInterpolator)
     end
 end
 
-"""
-    _geos_get_height4(ds, itp, idx_lon, idx_lat, idx_z, idx_time, dnames, shape_ref)
 
-Try to load a 4-D geometric height field and return it in metres, permuted to
-(lon, lat, z, time). Returns `nothing` if not available.
-"""
 function _geos_get_height4(ds::NCDataset,
                            itp::GEOSFPInterpolator,
                            idx_lon::Int, idx_lat::Int, idx_z::Int, idx_time::Int,
@@ -1448,13 +1257,7 @@ function _geos_get_height4(ds::NCDataset,
     return nothing
 end
 
-"""
-    _hydrostatic_fill!(z_km, T_col, p_pa)
 
-Fill NaN entries in `z_km` using hydrostatic integration.
-`T_col` is temperature [K], `p_pa` is pressure [Pa], both length nz.
-GEOS pressure levels run top-to-bottom (p_pa[1] = TOA, p_pa[end] = surface).
-"""
 function _hydrostatic_fill!(z_km::Vector{Float64}, T_col::Vector{Float64}, p_pa::Vector{Float64})
     nz = length(z_km)
     @assert length(T_col) == nz
@@ -1505,13 +1308,6 @@ function _hydrostatic_fill!(z_km::Vector{Float64}, T_col::Vector{Float64}, p_pa:
     return z_km
 end
 
-"""
-    _geos_read_var(ds, varname) -> Array{Float64}
-
-Read a variable from a GEOS NetCDF dataset using NCDatasets' built-in CF decoding
-(scale_factor, add_offset, _FillValue → missing), then convert missing to NaN.
-This is the correct single-pass approach — do NOT call _cf_decode! on the result.
-"""
 function _geos_read_var(ds::NCDataset, varname::String)
     v = ds[varname]
     raw = Array(v)
@@ -1538,25 +1334,6 @@ function _nanmean_profile_lonlat(A::AbstractArray{<:Real,4})
     return out
 end
 
-
-"""
-    _geos_load_grids(ds, itp; file_time=nothing)
-
-Load a GEOS-FP `inst3_3d_asm_Np` dataset and return:
-
-    lat, lon, z, t, V, (latname, lonname, zname, tname)
-
-Where:
-- z is altitude in km
-- t is the dataset time axis
-- V is density in kg/m^3 with shape (lon, lat, z, time)
-
-This implementation is specifically for the pressure-level product:
-- T  : temperature [K]
-- QV : specific humidity [kg/kg]
-- lev: pressure levels [hPa]
-- H  : height [m]
-"""
 function _geos_load_grids(ds::NCDataset, itp::GEOSFPInterpolator; file_time::Union{DateTime,Nothing}=nothing)
 
     # ---- T ----
@@ -1791,6 +1568,8 @@ end
 #     end
 # end
 
+############ for now since we havent set up from 70km to 100km ################
+
 function _sciml_quad_logz(z::AbstractVector, v::AbstractVector, zq::Real)
     mask = (z .> 0) .& isfinite.(z) .& (v .> 0) .& isfinite.(v)
     z_ok = Float64.(z[mask])
@@ -1966,11 +1745,6 @@ function _init_msis_indices!(itp::NRLMSISEInterpolator)
     return nothing
 end
 
-"""
-    _select_backend(itp::HybridDensityInterpolator, alt_km) returns Symbol
-
-Choose which backend should answer the query based on altitude.
-"""
 @inline function _select_backend(itp::HybridDensityInterpolator, dt::DateTime, alt_km::Real)
     if alt_km > itp.msis_max_alt_km
         return :wam
@@ -1992,11 +1766,6 @@ end
 # GEOS-FP DENSITY INTERPOLATION HELPERS
 # =========================
 
-"""
-    _geos_interp_density_from_loaded(ds, itp, dt, latq, lonq, alt_km, mode)
-
-Evaluate density from one already-open GEOS dataset.
-"""
 function _geos_interp_density_from_loaded(ds::NCDataset,
                                           itp::GEOSFPInterpolator,
                                           dt::DateTime,
@@ -2024,11 +1793,7 @@ function _geos_interp_density_from_loaded(ds::NCDataset,
     return _interp4(lat, lon, z, tdts, V, latq, lonq, zq, tq; mode=mode)
 end
 
-"""
-    get_density(itp::WAMInterpolator, dt::DateTime, lat::Real, lon::Real, alt_km::Real)
 
-Return neutral density at (`dt`, `lat`, `lon`, `alt_km`) using WAM‑IPE outputs.
-"""
 function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
     mode = _validate_query_args(itp.interpolation, dt, latq, lonq, alt_km)
 
@@ -2092,12 +1857,6 @@ function get_density(itp::NRLMSISEInterpolator, dt::DateTime, latq::Real, lonq::
     return float(out.total_density)
 end
 
-"""
-    get_density(itp::GEOSFPInterpolator, dt::DateTime, lat::Real, lon::Real, alt_km::Real)
-
-Return density at (`dt`, `lat`, `lon`, `alt_km`) using GEOS-FP data.
-This backend is intended for use between 0 and 70 km.
-"""
 function get_density(itp::GEOSFPInterpolator, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
     mode = _validate_query_args_geos(itp, dt, latq, lonq, alt_km)
 
@@ -2129,13 +1888,7 @@ function get_density(itp::GEOSFPInterpolator, dt::DateTime, latq::Real, lonq::Re
     end
 end
 
-"""
-    get_density(itp::HybridDensityInterpolator, dt::DateTime, lat::Real, lon::Real, alt_km::Real)
 
-Automatically route density queries to:
-- GEOS-FP for low altitude
-- WAM-IPE for higher altitude
-"""
 function get_density(itp::HybridDensityInterpolator, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
     backend = _select_backend(itp, dt, alt_km)
 
@@ -2148,11 +1901,7 @@ function get_density(itp::HybridDensityInterpolator, dt::DateTime, latq::Real, l
     end
 end
 
-"""
-    get_density_batch(itp, dts, lats, lons, alts_km) -> Vector{Float64}
 
-Vectorised call matching Python API.
-"""
 function get_density_batch(itp::WAMInterpolator, dts::AbstractVector{<:DateTime},
                            lats::AbstractVector, lons::AbstractVector, alts_km::AbstractVector)
     n = length(dts)
@@ -2169,11 +1918,6 @@ function get_density_batch(itp::WAMInterpolator, dts::AbstractVector{<:DateTime}
     return results
 end
 
-"""
-    get_density_batch(itp::GEOSFPInterpolator, dts, lats, lons, alts_km) -> Vector{Float64}
-
-Vectorised GEOS-FP density retrieval.
-"""
 function get_density_batch(itp::GEOSFPInterpolator, dts::AbstractVector{<:DateTime},
                            lats::AbstractVector, lons::AbstractVector, alts_km::AbstractVector)
     n = length(dts)
@@ -2202,11 +1946,6 @@ function get_density_batch(itp::NRLMSISEInterpolator, dts::AbstractVector{<:Date
     return results
 end
 
-"""
-    get_density_batch(itp::HybridDensityInterpolator, dts, lats, lons, alts_km)
-
-Hybrid vectorised density retrieval.
-"""
 function get_density_batch(itp::HybridDensityInterpolator,
                            dts::AbstractVector{<:DateTime},
                            lats::AbstractVector,
@@ -2250,26 +1989,6 @@ function get_density_from_key(itp::WAMInterpolator, key::AbstractString,
     end
 end
 
-"""
-    get_density_at_point(itp, dt, lat, lon, alt_m;
-                         angles_in_deg = false)
-
-Wrapper around `get_density` that works directly with altitude in metres and
-angles in either radians or degrees.
-
-Arguments
----------
-- `itp::WAMInterpolator` : configuration object.
-- `dt::DateTime`         : physical time of the state (UTC).
-- `lat::Real`            : latitude (rad by default).
-- `lon::Real`            : longitude (rad by default).
-- `alt_m::Real`          : geometric altitude in metres.
-
-Keyword arguments
------------------
-- `angles_in_deg::Bool=false` : set to `true` if `lat`/`lon` are already in
-    degrees. Otherwise they are assumed to be in radians and converted.
-"""
 function get_density_at_point(itp::WAMInterpolator,
                               dt::DateTime,
                               lat::Real,
@@ -2287,12 +2006,7 @@ function get_density_at_point(itp::WAMInterpolator,
     return get_density(itp, dt, lat_deg, lon_deg, alt_km)
 end
 
-"""
-    get_density_at_point(itp::GEOSFPInterpolator, dt, lat, lon, alt_m; angles_in_deg=false)
 
-GEOS-FP wrapper around `get_density` using altitude in metres and angles in
-either radians or degrees.
-"""
 function get_density_at_point(itp::GEOSFPInterpolator,
                               dt::DateTime,
                               lat::Real,
@@ -2321,11 +2035,6 @@ function get_density_at_point(itp::NRLMSISEInterpolator,
     return get_density(itp, dt, lat_deg, lon_deg, alt_km)
 end
 
-"""
-    get_density_at_point(itp::HybridDensityInterpolator, dt, lat, lon, alt_m; angles_in_deg=false)
-
-Hybrid wrapper around `get_density` using altitude in metres.
-"""
 function get_density_at_point(itp::HybridDensityInterpolator,
                               dt::DateTime,
                               lat::Real,
@@ -2338,28 +2047,6 @@ function get_density_at_point(itp::HybridDensityInterpolator,
     return get_density(itp, dt, lat_deg, lon_deg, alt_km)
 end
 
-"""
-    get_density_trajectory(itp, dts, lats, lons, alts_m;
-                           angles_in_deg = false)
-
-Vectorised wrapper around `get_density` for a full trajectory.
-
-Arguments
----------
-- `dts::AbstractVector{<:DateTime}` : time stamps along the trajectory.
-- `lats::AbstractVector`            : latitudes (rad by default).
-- `lons::AbstractVector`            : longitudes (rad by default).
-- `alts_m::AbstractVector`          : altitudes in metres.
-
-Keyword arguments
------------------
-- `angles_in_deg::Bool=false` : set to `true` if `lats`/`lons` are already in
-    degrees; otherwise they are assumed to be in radians.
-
-Returns
--------
-`Vector{Float64}` of neutral densities, same length as `dts`.
-"""
 function get_density_trajectory(itp::WAMInterpolator,
                                 dts::AbstractVector{<:DateTime},
                                 lats::AbstractVector,
@@ -2384,11 +2071,6 @@ function get_density_trajectory(itp::WAMInterpolator,
     return get_density_batch(itp, dts, latv, lonv, altkm)
 end
 
-"""
-    get_density_trajectory(itp::GEOSFPInterpolator, dts, lats, lons, alts_m; angles_in_deg=false)
-
-Vectorised GEOS-FP trajectory density retrieval.
-"""
 function get_density_trajectory(itp::GEOSFPInterpolator,
                                 dts::AbstractVector{<:DateTime},
                                 lats::AbstractVector,
@@ -2435,11 +2117,6 @@ function get_density_trajectory(itp::NRLMSISEInterpolator,
     return get_density_batch(itp, dts, latv, lonv, altkm)
 end
 
-"""
-    get_density_trajectory(itp::HybridDensityInterpolator, dts, lats, lons, alts_m; angles_in_deg=false)
-
-Hybrid trajectory density retrieval.
-"""
 function get_density_trajectory(itp::HybridDensityInterpolator,
                                 dts::AbstractVector{<:DateTime},
                                 lats::AbstractVector,
@@ -2463,13 +2140,6 @@ function get_density_trajectory(itp::HybridDensityInterpolator,
     return get_density_batch(itp, dts, latv, lonv, altkm)
 end
 
-"""
-    get_density_trajectory_optimised(itp, dts, lats, lons, alts_m;
-                                     angles_in_deg = false)
-
-Optimised trajectory density retrieval that groups queries by file pairs,
-loading each file pair only once for all points that need it.
-"""
 function get_density_trajectory_optimised(itp::WAMInterpolator,
                                          dts::AbstractVector{<:DateTime},
                                          lats::AbstractVector,
@@ -2558,11 +2228,6 @@ function get_density_trajectory_optimised(itp::WAMInterpolator,
     return results
 end
 
-"""
-    get_density_trajectory_optimised(itp::GEOSFPInterpolator, dts, lats, lons, alts_m; angles_in_deg=false)
-
-Optimised GEOS-FP trajectory retrieval that groups queries by bracketing file pair.
-"""
 function get_density_trajectory_optimised(itp::GEOSFPInterpolator,
                                           dts::AbstractVector{<:DateTime},
                                           lats::AbstractVector,
@@ -2666,12 +2331,7 @@ function get_density_trajectory_optimised(itp::NRLMSISEInterpolator,
     return get_density_trajectory(itp, dts, lats, lons, alts_m; angles_in_deg=angles_in_deg)
 end
 
-"""
-    get_density_trajectory_optimised(itp::HybridDensityInterpolator, dts, lats, lons, alts_m; angles_in_deg=false)
 
-Hybrid optimised trajectory retrieval.
-Currently routes each point individually so backend selection remains correct.
-"""
 function get_density_trajectory_optimised(itp::HybridDensityInterpolator,
                                           dts::AbstractVector{<:DateTime},
                                           lats::AbstractVector,
@@ -2681,12 +2341,7 @@ function get_density_trajectory_optimised(itp::HybridDensityInterpolator,
     return get_density_trajectory(itp, dts, lats, lons, alts_m; angles_in_deg=angles_in_deg)
 end
 
-"""
-    prewarm_cache!(itp::WAMInterpolator, dts::AbstractVector{<:DateTime})
 
-Pre-download all unique file pairs needed for the given time stamps.
-Returns the number of unique file pairs downloaded.
-"""
 function prewarm_cache!(itp::WAMInterpolator, dts::AbstractVector{<:DateTime})
     unique_files = Set{Tuple{String,String}}()
     for dt in dts
@@ -2700,12 +2355,6 @@ function prewarm_cache!(itp::WAMInterpolator, dts::AbstractVector{<:DateTime})
 end
 
 
-"""
-    prewarm_cache!(itp::GEOSFPInterpolator, dts)
-
-Pre-download all unique GEOS-FP file pairs needed for the given time stamps.
-Returns the number of unique file pairs touched.
-"""
 function prewarm_cache!(itp::GEOSFPInterpolator, dts::AbstractVector{<:DateTime})
     unique_files = Set{Tuple{String,String}}()
     for dt in dts
@@ -2722,12 +2371,6 @@ function prewarm_cache!(itp::NRLMSISEInterpolator, dts::AbstractVector{<:DateTim
     return 0
 end
 
-"""
-    prewarm_cache!(itp::HybridDensityInterpolator, dts, alts_km)
-
-Prewarm whichever backend each query altitude requires.
-Returns a named tuple with counts.
-"""
 function prewarm_cache!(itp::HybridDensityInterpolator,
                         dts::AbstractVector{<:DateTime},
                         alts_km::AbstractVector)
@@ -2774,14 +2417,6 @@ function _mean_lonlat_over_z(V3::AbstractArray{<:Real,3})
     return out
 end
 
-"""
-    mean_density_profile(itp::WAMInterpolator, dt::DateTime)
-        -> (alt_km::Vector{Float64}, dens_mean::Vector{Float64})
-
-Returns the global-mean neutral density profile at time `dt`, produced by
-averaging across all longitudes and latitudes at each altitude level, with
-linear time interpolation between the two bracketing files.
-"""
 function mean_density_profile(itp::WAMInterpolator, dt::DateTime)
     # Resolve the two files bracketing dt
     p_lo, p_hi, _, _ = _get_two_files_exact(itp, dt)
@@ -2839,13 +2474,6 @@ function mean_density_profile(itp::WAMInterpolator, dt::DateTime)
     end
 end
 
-"""
-    plot_global_mean_profile(itp::WAMInterpolator, dt::DateTime;
-                             alt_max_km::Real=500, savepath::Union{Nothing,String}=nothing)
-
-Plots the global-mean density profile (density vs altitude, log x-axis).
-Returns the Plots.jl plot object. If `savepath` is given, saves the figure.
-"""
 function plot_global_mean_profile(itp::WAMInterpolator, dt::DateTime;
                                   alt_max_km::Real=500, savepath::Union{Nothing,String}=nothing)
     alt_km, dens = mean_density_profile(itp, dt)
@@ -2895,18 +2523,6 @@ function _extend_profile_to_zero(alt_km::AbstractVector{<:Real},
     return vcat(0.0, collect(alt_km)), vcat(d0, collect(dens))
 end
 
-"""
-    plot_global_mean_profile_plots(itp, dt;
-        alt_max_km = nothing,
-        extend_to0 = false,
-        savepath   = nothing,
-        export_csv = false,
-        base_dir   = "plots")
-
-Creates plots/<product>/<YYYYMMDDTHHMMSS>/ and saves
-global_mean_profile.png (and .csv if requested) there using Plots.jl.
-Returns (plot_object, png_path, csv_path_or_nothing).
-"""
 function plot_global_mean_profile_plots(itp::WAMInterpolator, dt::DateTime;
     alt_max_km::Union{Nothing,Real}=nothing,
     extend_to0::Bool=false,
@@ -2964,16 +2580,6 @@ function plot_global_mean_profile_plots(itp::WAMInterpolator, dt::DateTime;
     return p, png_path, csv_path
 end
 
-
-# =========================
-# GEOS DEBUG / INSPECTION HELPERS
-# =========================
-
-"""
-    inspect_geos_file(path)
-
-Print variable names, dimension names, sizes, and selected attributes for a local GEOS file.
-"""
 function inspect_geos_file(path::AbstractString)
     ds = NCDataset(String(path), "r")
     try
@@ -3003,11 +2609,6 @@ function inspect_geos_file(path::AbstractString)
     return nothing
 end
 
-"""
-    inspect_geos_remote_file(itp, dt)
-
-Download/cache one GEOS file for `dt` and inspect it.
-"""
 function inspect_geos_remote_file(itp::GEOSFPInterpolator, dt::DateTime)
     path = _geos_download_to_cache(itp, dt; verbose=true)
     inspect_geos_file(path)
