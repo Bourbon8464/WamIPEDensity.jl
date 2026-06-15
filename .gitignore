@@ -1,5 +1,5 @@
 to-do.txt
 cache
-docs
+docs/build/
 plots
 tests.jl

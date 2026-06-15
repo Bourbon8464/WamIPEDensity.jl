@@ -19,6 +19,7 @@ using FilePathsBase: joinpath
 using Base: mkpath
 using SatelliteToolbox
 using SatelliteToolboxAtmosphericModels
+using LinearAlgebra
 
 # EXPORTS
 
@@ -86,6 +87,13 @@ Base.@kwdef struct WAMInterpolator
 end
 
 
+"""
+    GEOSFPInterpolator(; root_url, collection, interpolation, cache_dir, kwargs...)
+
+Configuration object for GEOS-FP density reconstruction. GEOS-FP is used for
+lower-atmosphere density estimates and can be combined with WAM-IPE and
+NRLMSISE through [`HybridDensityInterpolator`](@ref).
+"""
 Base.@kwdef struct GEOSFPInterpolator
     root_url::String = "https://portal.nccs.nasa.gov/datashare/gmao/geos-fp/das"
     collection::String = "inst3_3d_asm_Np"
@@ -102,6 +110,12 @@ Base.@kwdef struct GEOSFPInterpolator
     min_alt_km::Float64 = 0.0
     max_alt_km::Float64 = 70.0
 end
+"""
+    NRLMSISEInterpolator(; interpolation=:nearest, min_alt_km=0.0, max_alt_km=100.0)
+
+Configuration object for the NRLMSISE empirical atmosphere backend. This
+backend is useful as a fallback or as one component of a hybrid density model.
+"""
 Base.@kwdef struct NRLMSISEInterpolator
     interpolation::Symbol = :nearest   # kept only for API symmetry
     min_alt_km::Float64 = 0.0
@@ -110,6 +124,12 @@ Base.@kwdef struct NRLMSISEInterpolator
 end
 
 
+"""
+    HybridDensityInterpolator(; geos, msis, wam, msis_max_alt_km=100.0)
+
+Altitude-aware density interpolator that routes requests across GEOS-FP,
+NRLMSISE, and WAM-IPE backends.
+"""
 Base.@kwdef struct HybridDensityInterpolator
     geos::GEOSFPInterpolator = GEOSFPInterpolator()
     msis::NRLMSISEInterpolator = NRLMSISEInterpolator()
@@ -198,7 +218,12 @@ function _unpin_nc_cached(path::String)
     return nothing
 end
 
-# Optional: allow users to change cap at runtime
+"""
+    set_max_open_datasets!(n::Integer) -> Int
+
+Set the maximum number of NetCDF datasets kept open by the internal dataset
+pool. Returns the applied pool size.
+"""
 function set_max_open_datasets!(n::Integer)
     lock(_DSPOOL.lock) do
         _DSPOOL.max_open = max(1, Int(n))
@@ -610,39 +635,65 @@ function _get_cached_filepair(product::String, dt::DateTime)
     end
 end
 
-# GRID CACHING (AVOID RE-LOADING NETCDF DATA)
-const _GRID_CACHE = Dict{String, Tuple}()
+# # GRID CACHING (AVOID RE-LOADING NETCDF DATA)
+# const _GRID_CACHE = Dict{String, Tuple}()
+# const _GRID_CACHE_LOCK = ReentrantLock()
+# const _GRID_360_CACHE = Dict{UInt64, Bool}()
+# const _GRID_360_LOCK = ReentrantLock()
+# const _MAX_GRID_CACHE_SIZE = 20  # Keep last 20 file grids in RAM
+
+# GRID CACHING
+# Struct to hold coordinate info instead of full data arrays
+struct GridMetadata
+    lon::Vector{Float64}
+    lat::Vector{Float64}
+    z::Vector{Float64}
+    ds::NCDataset 
+    varname::String
+    
+    scale_factor::Float64
+    add_offset::Float64
+    fill_values::Set{Float64}
+    
+    dim_map::Dict{Symbol, Int}
+    ndims::Int
+end
+
+const _GRID_CACHE = Dict{String, GridMetadata}()
 const _GRID_CACHE_LOCK = ReentrantLock()
 const _GRID_360_CACHE = Dict{UInt64, Bool}()
 const _GRID_360_LOCK = ReentrantLock()
-const _MAX_GRID_CACHE_SIZE = 20  # Keep last 20 file grids in RAM
+const _MAX_GRID_CACHE_SIZE = 100  # Increased capacity from 20 to 100 since we are only using metadata now instead of full data arrays
 
-function _get_cached_grids(file_path::String, ds::NCDataset, varname::String, file_time::DateTime)
-    """Get or load grids with caching - avoids reloading same file"""
+function _get_cached_metadata(file_path::String, ds::NCDataset, varname::String)
+    """Get or load lightweight metadata with caching"""
     
     lock(_GRID_CACHE_LOCK) do
+        # Check cache
         if haskey(_GRID_CACHE, file_path)
-            return _GRID_CACHE[file_path]
+            meta = _GRID_CACHE[file_path]
+            if isopen(meta.ds)
+                return meta
+            end
         end
         
-        # Load grids (expensive operation - do once per file)
-        grids = _load_grids(ds, varname; file_time=file_time)
+        meta = _load_grid_metadata(ds, varname)
         
-        # Cache it
-        _GRID_CACHE[file_path] = grids
-        
-        # Limit cache size (LRU eviction)
+        _GRID_CACHE[file_path] = meta
         if length(_GRID_CACHE) > _MAX_GRID_CACHE_SIZE
-            # Remove first (oldest) entry
             delete!(_GRID_CACHE, first(keys(_GRID_CACHE)))
         end
         
-        return grids
+        return meta
     end
 end
 
+"""
+    clear_grid_cache!()
+
+Clear cached coordinate grids and decoded variable arrays from memory.
+"""
 function clear_grid_cache!()
-    """Clear the grid cache to free memory"""
     lock(_GRID_CACHE_LOCK) do
         empty!(_GRID_CACHE)
     end
@@ -1237,6 +1288,139 @@ function _load_grids(ds::NCDataset, varname::String; file_time::Union{DateTime,N
 
     else
         error("Expected 3D or 4D var '$varname', got ndims=$(nd) with dims=$(dnames)")
+    end
+end
+
+
+function _load_grid_metadata(ds::NCDataset, varname::String)
+    haskey(ds, varname) || error("Variable '$varname' not found.")
+    v = ds[varname]
+    dnames = String.(NCDatasets.dimnames(v))
+
+    function classify_dim(dname::String)
+        lname = lowercase(dname)
+        var = haskey(ds, dname) ? ds[dname] : nothing
+        attrs = var === nothing ? Dict{String,Any}() : Dict(var.attrib)
+        stdname = lowercase(string(get(attrs, "standard_name", "")))
+        axis = uppercase(string(get(attrs, "axis", "")))
+        units = lowercase(string(get(attrs, "units", "")))
+        
+        if occursin("time", lname) || axis == "T" || stdname == "time"; return :time; end
+        if occursin("lat", lname) || stdname == "latitude" || axis == "Y" || occursin("degrees_north", units); return :lat; end
+        if occursin("lon", lname) || stdname == "longitude" || axis == "X" || occursin("degrees_east", units); return :lon; end
+        if occursin("lev", lname) || occursin("height", lname) || occursin("alt", lname) || lname == "z" || axis == "Z"; return :z; end
+        if lname in ("x","grid_xt","i","nx"); return :lon; end
+        if lname in ("y","grid_yt","j","ny"); return :lat; end
+        return :unknown
+    end
+
+    roles = map(classify_dim, dnames)
+    nd = ndims(v) # Determine if 3D or 4D from the variable directly
+
+    idx_lon  = findfirst(==( :lon ), roles)
+    idx_lat  = findfirst(==( :lat ), roles)
+    idx_z    = findfirst(==( :z   ), roles)
+    idx_time = findfirst(==( :time ), roles)
+
+    get_coord = (i) -> haskey(ds, dnames[i]) ? Float64.(collect(ds[dnames[i]][:])) : collect(1.0:1.0:float(size(v, i)))
+    
+    lon = get_coord(idx_lon)
+    lat = get_coord(idx_lat)
+    z   = get_coord(idx_z)
+    
+    attrs_any = try Dict(v.attrib) catch; Dict(CommonDataModel.attributes(v)) end
+    sf = haskey(attrs_any, "scale_factor") ? float(attrs_any["scale_factor"]) : 1.0
+    ao = haskey(attrs_any, "add_offset")   ? float(attrs_any["add_offset"])   : 0.0
+    
+    fillvals = Set{Float64}()
+    for k in ("_FillValue", "missing_value")
+        if haskey(attrs_any, k)
+            val = attrs_any[k]
+            if val isa AbstractArray
+                for x in val; !ismissing(x) && push!(fillvals, float(x)); end
+            else
+                !ismissing(val) && push!(fillvals, float(val))
+            end
+        end
+    end
+
+    dim_map = Dict{Symbol, Int}()
+    if idx_lon !== nothing; dim_map[:lon] = idx_lon; end
+    if idx_lat !== nothing; dim_map[:lat] = idx_lat; end
+    if idx_z   !== nothing; dim_map[:z]   = idx_z; end
+    if idx_time !== nothing; dim_map[:time] = idx_time; end
+
+    return GridMetadata(lon, lat, z, ds, varname, sf, ao, fillvals, dim_map, nd)
+end
+
+
+function _decode_value(val::Float64, meta::GridMetadata)
+    if isnan(val) || ismissing(val) || val in meta.fillvals
+        return NaN
+    end
+    return val * meta.scale_factor + meta.add_offset
+end
+
+function _get_density_wam_core(meta::GridMetadata, lon_q::Float64, lat_q::Float64, z_q::Float64)
+    function get_bracket(arr, val)
+        n = length(arr)
+        if val <= arr[1]; return (1, 2); end
+        if val >= arr[n]; return (n-1, n); end
+        i = searchsortedfirst(arr, val)
+        return (i-1, i)
+    end
+
+    il, ih = get_bracket(meta.lon, lon_q)
+    jl, jh = get_bracket(meta.lat, lat_q)
+    kl, kh = get_bracket(meta.z, z_q)
+
+    ranges = Vector{Union{Colon, UnitRange{Int}}}(undef, meta.ndims)
+    
+    for i in 1:meta.ndims
+        if haskey(meta.dim_map, :lon) && meta.dim_map[:lon] == i
+            ranges[i] = il:ih
+        elseif haskey(meta.dim_map, :lat) && meta.dim_map[:lat] == i
+            ranges[i] = jl:jh
+        elseif haskey(meta.dim_map, :z) && meta.dim_map[:z] == i
+            ranges[i] = kl:kh
+        else
+            ranges[i] = Colon()
+        end
+    end
+
+    # Read Tiny Slice (2x2x2)
+    try
+        raw_slice = meta.ds[meta.varname][ranges...]
+        
+        perm = Int[]
+        if haskey(meta.dim_map, :lon) push!(perm, meta.dim_map[:lon]) end
+        if haskey(meta.dim_map, :lat) push!(perm, meta.dim_map[:lat]) end
+        if haskey(meta.dim_map, :z) push!(perm, meta.dim_map[:z]) end
+        
+        data = length(perm) == 3 ? Array(PermutedDimsArray(raw_slice, (perm...,))) : raw_slice
+        
+        v = Array{Float64}(undef, 2, 2, 2)
+        for idx in CartesianIndices(data)
+            val = data[idx]
+            v[idx] = _decode_value(ismissing(val) ? NaN : Float64(val), meta)
+        end
+
+        x = (lon_q - meta.lon[il]) / (meta.lon[ih] - meta.lon[il])
+        y = (lat_q - meta.lat[jl]) / (meta.lat[jh] - meta.lat[jl])
+        z_w = (z_q - meta.z[kl]) / (meta.z[kh] - meta.z[kl])
+
+        c00 = v[1,1,1] * (1-z_w) + v[1,1,2] * z_w
+        c01 = v[1,2,1] * (1-z_w) + v[1,2,2] * z_w
+        c10 = v[2,1,1] * (1-z_w) + v[2,1,2] * z_w
+        c11 = v[2,2,1] * (1-z_w) + v[2,2,2] * z_w
+        # Interpolate Y
+        c0 = c00 * (1-y) + c01 * y
+        c1 = c10 * (1-y) + c11 * y
+        # Interpolate X
+        return c0 * (1-x) + c1 * x
+
+    catch e
+        return NaN
     end
 end
 
@@ -3012,6 +3196,80 @@ function inspect_geos_remote_file(itp::GEOSFPInterpolator, dt::DateTime)
     path = _geos_download_to_cache(itp, dt; verbose=true)
     inspect_geos_file(path)
     return path
+end
+
+function get_density_at_point(itp::WAMInterpolator, lon::Real, lat::Real, alt_km::Real, dt::DateTime)
+    p_lo, p_hi, _, _ = _get_two_files_exact(itp, dt)
+    
+    meta_lo = _get_cached_metadata(p_lo, _open_nc_cached(p_lo), itp.varname)
+    meta_hi = _get_cached_metadata(p_hi, _open_nc_cached(p_hi), itp.varname)
+    
+    dt_lo, dt_hi = _surrounding_10min(dt)
+    
+    if dt_lo == dt_hi
+        val = _get_density_wam_core(meta_lo, Float64(lon), Float64(lat), Float64(alt_km))
+    else
+        w_lo = (dt_hi - dt) / Millisecond(600)
+        w_hi = (dt - dt_lo) / Millisecond(600)
+        val_lo = _get_density_wam_core(meta_lo, Float64(lon), Float64(lat), Float64(alt_km))
+        val_hi = _get_density_wam_core(meta_hi, Float64(lon), Float64(lat), Float64(alt_km))
+        val = val_lo * w_lo + val_hi * w_hi
+    end
+
+    _unpin_nc_cached(p_lo)
+    _unpin_nc_cached(p_hi)
+    
+    return val
+end
+
+const get_density = get_density_at_point
+
+function get_density_batch(itp::WAMInterpolator, lons::AbstractVector, lats::AbstractVector, alts::AbstractVector, dts::AbstractVector{DateTime})
+    n = length(dts)
+    @assert length(lons) == length(lats) == length(alts) == n
+    results = Vector{Float64}(undef, n)
+    
+    # Group by 10-minute window to minimize file handles
+    groups = Dict{Tuple{String, DateTime}, Vector{Int}}()
+    for (i, dt) in enumerate(dts)
+        key = (itp.product, _datetime_floor_10min(dt))
+        if !haskey(groups, key); groups[key] = Int[]; end
+        push!(groups[key], i)
+    end
+    
+    for ((product, dt_floor), indices) in groups
+        p_lo, p_hi, _, _ = _get_two_files_exact(itp, dt_floor)
+        meta_lo = _get_cached_metadata(p_lo, _open_nc_cached(p_lo), itp.varname)
+        meta_hi = _get_cached_metadata(p_hi, _open_nc_cached(p_hi), itp.varname)
+        
+        dt_lo, dt_hi = _surrounding_10min(dt_floor)
+        
+        for i in indices
+            t = dts[i]
+            if dt_lo == dt_hi
+                results[i] = _get_density_wam_core(meta_lo, lons[i], lats[i], alts[i])
+            else
+                w_lo = (dt_hi - t) / Millisecond(600)
+                w_hi = (t - dt_lo) / Millisecond(600)
+                v_lo = _get_density_wam_core(meta_lo, lons[i], lats[i], alts[i])
+                v_hi = _get_density_wam_core(meta_hi, lons[i], lats[i], alts[i])
+                results[i] = v_lo * w_lo + v_hi * w_hi
+            end
+        end
+        
+        _unpin_nc_cached(p_lo)
+        _unpin_nc_cached(p_hi)
+    end
+    
+    return results
+end
+
+function get_density_trajectory(itp::WAMInterpolator, lon::AbstractVector, lat::AbstractVector, alt::AbstractVector, time::AbstractVector{DateTime})
+    get_density_batch(itp, lon, lat, alt, time)
+end
+
+function get_density_trajectory_optimised(itp::WAMInterpolator, lon::AbstractVector, lat::AbstractVector, alt::AbstractVector, time::AbstractVector{DateTime})
+    get_density_batch(itp, lon, lat, alt, time)
 end
 
 end # module

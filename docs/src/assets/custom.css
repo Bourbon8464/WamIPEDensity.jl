@@ -1,0 +1,17 @@
+:root {
+    --wamipe-accent: #1b6f6a;
+}
+
+.content a {
+    color: var(--wamipe-accent);
+}
+
+.content pre {
+    border-radius: 6px;
+}
+
+.content h1,
+.content h2,
+.content h3 {
+    letter-spacing: 0;
+}

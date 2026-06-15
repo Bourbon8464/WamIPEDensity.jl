@@ -36,6 +36,22 @@ instanstiate
 ```
 ---
 
+## Documentation
+
+The documentation site lives in `docs/` and can be built locally with:
+
+```julia
+using Pkg
+Pkg.activate("docs")
+Pkg.develop(path=".")
+Pkg.instantiate()
+include("docs/make.jl")
+```
+
+After building, open `docs/build/index.html`.
+
+---
+
 ## Changelog:
 ### Updates to Structure and Exports:
 - Changed `WAMInterpolator` to have:
