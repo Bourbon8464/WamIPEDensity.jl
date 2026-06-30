@@ -6,43 +6,39 @@ using Statistics
 using AWS
 using AWSS3
 using NCDatasets
-using Interpolations
 using HTTP
-using EzXML
-using URIs
 using DataInterpolations
 using Serialization
 using CommonDataModel
 using Plots
-using CSV, DataFrames 
-using FilePathsBase: joinpath
-using Base: mkpath
 using SatelliteToolbox
 using SatelliteToolboxAtmosphericModels
 using LinearAlgebra
+import SpaceIndices
 
 # EXPORTS
 
 export WAMInterpolator, GEOSFPInterpolator, NRLMSISEInterpolator, HybridDensityInterpolator,
+       density, leo_config, lower_atmo_config,
        get_density, get_density_batch, get_density_at_point, 
        get_density_trajectory, get_density_trajectory_optimised, mean_density_profile, 
        plot_global_mean_profile, plot_global_mean_profile_plots,
        prewarm_cache!, set_max_open_datasets!, print_cache_stats, clear_grid_cache!,
+       get_density_batch!, clean_cache!,
        inspect_geos_file, inspect_geos_remote_file
 
 # CONSTANTS AND GLOBAL STATE
 const _CACHE_META_FILE = "metadata.bin"
 const DEFAULT_CACHE_DIR = normpath("./cache")
+
 # GEOS-FP constants
+const _GEOS_GRID_CACHE      = Dict{String, Tuple}()
+const _GEOS_GRID_CACHE_LOCK = ReentrantLock()
+const _MAX_GEOS_GRID_CACHE  = 4    
 const DEFAULT_GEOS_CACHE_DIR = normpath("./cache_geosfp")
 const R_D_GEOS  = 287.05          # J/(kg*K)
 const G0_GEOS   = 9.80665         # m/s^2
-const P_TOP_GEOS = 0.01           # Pa fallback top pressure for DELP integration
-
-# Run timer state
-const _WIPED_RUN_START_WALL = Ref{DateTime}(DateTime(0))
-const _WIPED_RUN_START_NS   = Ref{Int}(0)
-const _WIPED_TIMER_READY    = Ref(false)
+const _GEOS_BOUNDS_LOCK = ReentrantLock()
 
 # File pair cache for temporal interpolation
 const _FILEPAIR_CACHE = Dict{Tuple{String,DateTime}, Tuple{String,String,String,String}}()
@@ -50,20 +46,13 @@ const _FILEPAIR_LOCK  = ReentrantLock()
 
 # Allowed interpolation modes
 const _ALLOWED_INTERP_NORM = Set([:nearest, :linear, :logz_linear, :logz_quadratic])
+const _VALID_TIME_REGEX = r"(\d{8})_(\d{6})\.nc$"
 
 # Version windows for WAM-IPE data
 const _VERSION_WINDOWS = (
     ("v1.1", DateTime(2023,3,20,21,10,0), DateTime(2023,6,30,21,0,0)), # inclusive start/end
     ("v1.2", DateTime(2023,6,30,21,10,0), nothing), # open-ended
 )
-
-# Special WRS cycle constants
-const _WRS_00Z_FIRST_TIME = Time(3, 10, 0)  # first valid file under 00Z folder is ..._031000.nc
-
-# Cache metadata
-const _CACHE_META_FILE = "metadata.bin"
-
-# MAIN DATA STRUCTURE
 
 """
     WAMInterpolator(; bucket="noaa-nws-wam-ipe-pds", product="wfs", varname="den",
@@ -100,7 +89,6 @@ Base.@kwdef struct GEOSFPInterpolator
     interpolation::Symbol = :sciml
     cache_dir::String = DEFAULT_GEOS_CACHE_DIR
 
-    # variable names confirmed from your file
     qv_varname::String = "QV"
     t_varname::String = "T"
     z_varname::String = "H"
@@ -117,7 +105,7 @@ Configuration object for the NRLMSISE empirical atmosphere backend. This
 backend is useful as a fallback or as one component of a hybrid density model.
 """
 Base.@kwdef struct NRLMSISEInterpolator
-    interpolation::Symbol = :nearest   # kept only for API symmetry
+    interpolation::Symbol = :nearest  
     min_alt_km::Float64 = 0.0
     max_alt_km::Float64 = 100.0
     space_indices_initialized::Base.RefValue{Bool} = Ref(false)
@@ -138,8 +126,10 @@ Base.@kwdef struct HybridDensityInterpolator
     geos_bounds_cache::Dict{DateTime, Tuple{Float64, Float64}} = Dict{DateTime, Tuple{Float64, Float64}}()
 end
 
-# AWS CONFIGURATION
+# Module-level default interpolator, created lazily by density().
+const _DEFAULT_ITP = Ref{Union{Nothing, HybridDensityInterpolator}}(nothing)
 
+# AWS CONFIGURATION
 """
     _aws_cfg(region) returns AWS.AWSConfig
 
@@ -150,13 +140,12 @@ function _aws_cfg(region::String)
     AWS.AWSConfig(; region=region, creds=nothing)
 end
 
-# NETCDF DATASET POOLING (LRU CACHE FOR OPEN FILES)
-
+# NETCDF DATASET POOLING 
 mutable struct _DSPool
-    map::Dict{String,NCDataset}      # path → open dataset
-    pins::Dict{String,Int}           # path → active users
-    last::Dict{String,Int64}         # path → last use (time_ns)
-    max_open::Int                    # cap on simultaneously open datasets
+    map::Dict{String,NCDataset}      
+    pins::Dict{String,Int}          
+    last::Dict{String,Int64}         
+    max_open::Int                    
     lock::ReentrantLock
 end
 
@@ -168,7 +157,6 @@ const _DSPOOL = _DSPool(
     ReentrantLock()
 )
 
-# Touch for LRU
 @inline function _ds_touch!(pool::_DSPool, path::String)
     pool.last[path] = time_ns()
 end
@@ -237,15 +225,16 @@ end
 mutable struct _FileCache
     dir::String
     max_bytes::Int64
-    map::Dict{String,String}          # key → local_path
-    sizes::Dict{String,Int64}         # key → bytes
-    order::Vector{String}             # LRU order, oldest at index 1
-    bytes::Int64                      # current bytes on disc
-    downloading::Set{String}          # keys currently being downloaded
-    conds::Dict{String,Condition}     # key → Condition for waiters
-    lock::ReentrantLock               # global cache lock
+    map::Dict{String,String}
+    sizes::Dict{String,Int64}
+    order::Vector{String}
+    access_time::Dict{String,Int}       
+    access_counter::Int             
+    bytes::Int64
+    downloading::Set{String}
+    conds::Dict{String,Condition}
+    lock::ReentrantLock
 end
-
 # Cache instances keyed by (dir, max_bytes)
 const _CACHES = Dict{Tuple{String,Int64}, _FileCache}()
 
@@ -266,31 +255,32 @@ corrupt/old metadata and recreates missing fields.
 """
 function _load_cache(dir::AbstractString, max_bytes::Int64)
     mkpath(dir)
-    meta = _cache_meta_path(dir)
-    if isfile(meta)
+    meta_path = _cache_meta_path(dir)
+
+    if isfile(meta_path)
         try
-            open(meta, "r") do io
-                obj = deserialize(io)
-                if obj isa _FileCache
-                    obj.bytes = sum(values(obj.sizes))
-                    obj.order = [k for k in obj.order if haskey(obj.map, k)]
-                    obj.lock = ReentrantLock()
-                    empty!(obj.downloading); empty!(obj.conds)
-                    return obj
-                end
+            obj = open(meta_path, "r") do io
+                deserialize(io)
             end
-        catch
+            if obj isa _FileCache
+                obj.bytes  = sum(values(obj.sizes))
+                obj.order  = [k for k in obj.order if haskey(obj.map, k)]
+                obj.lock   = ReentrantLock()
+                empty!(obj.downloading)
+                empty!(obj.conds)
+                return obj
+            end
+        catch err
+            @warn "Cache metadata unreadable — starting fresh" path=meta_path exception=err
         end
     end
+
     return _FileCache(
-        String(dir),
-        Int64(max_bytes),
-        Dict{String,String}(),
-        Dict{String,Int64}(),
-        String[],
-        0,
-        Set{String}(),
-        Dict{String,Condition}(),
+        String(dir), Int64(max_bytes),
+        Dict{String,String}(), Dict{String,Int64}(),
+        String[], Dict{String,Int}(), 0, 
+        Int64(0),
+        Set{String}(), Dict{String,Condition}(),
         ReentrantLock()
     )
 end
@@ -313,13 +303,9 @@ end
 
 Mark `key` as most-recently-used in `cache`.
 """
-function _lru_touch!(cache::_FileCache, key::String)
-    # remove if present
-    idx = findfirst(==(key), cache.order)
-    if idx !== nothing
-        deleteat!(cache.order, idx)
-    end
-    push!(cache.order, key)
+@inline function _lru_touch!(cache::_FileCache, key::String)
+    cache.access_counter += 1
+    cache.access_time[key] = cache.access_counter
 end
 
 """
@@ -329,21 +315,19 @@ Deletes least-recently-used files from disc until the cache fits within
 `cache.max_bytes`.
 """
 function _evict_until_under_budget!(cache::_FileCache)
-    while cache.bytes > cache.max_bytes && !isempty(cache.order)
-        victim = first(cache.order)
-        popfirst!(cache.order)
-        if haskey(cache.map, victim)
-            local_path = cache.map[victim]
-            sz = get(cache.sizes, victim, 0)
-            try
-                isfile(local_path) && rm(local_path; force=true)
-            catch
-                # ignore I/O errors on delete
-            end
-            delete!(cache.map, victim)
-            delete!(cache.sizes, victim)
-            cache.bytes = max(0, cache.bytes - sz)
+    while cache.bytes > cache.max_bytes
+        isempty(cache.map) && break
+        victim = argmin(k -> get(cache.access_time, k, 0), keys(cache.map))
+        local_path = cache.map[victim]
+        sz = get(cache.sizes, victim, Int64(0))
+        try
+            isfile(local_path) && rm(local_path; force=true)
+        catch
         end
+        delete!(cache.map,         victim)
+        delete!(cache.sizes,       victim)
+        delete!(cache.access_time, victim)
+        cache.bytes = max(Int64(0), cache.bytes - sz)
     end
 end
 
@@ -354,60 +338,64 @@ Core cache routine. If present, return the cached path. Otherwise download the
 object (AWSS3 stream with HTTP fallback), store it atomically, update LRU and
 size accounting, possibly evicting older files. Safe for concurrent threads.
 """
-function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String, key::String;
-                          verbose::Bool=true)
+function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig,
+                          bucket::String, key::String; verbose::Bool=true)
     local_path = normpath(joinpath(cache.dir, key))
 
-    # fast path: already on disc and recorded
-    lock(cache.lock) do
+    hit_path = lock(cache.lock) do
         if haskey(cache.map, key) && isfile(cache.map[key])
             _lru_touch!(cache, key)
-            _save_cache(cache)
-            verbose && println("[cache] hit: ", cache.map[key])
+            @debug "Cache hit" path=cache.map[key]
             return cache.map[key]
         end
+        return nothing
+    end
+    hit_path !== nothing && return hit_path
 
-        if key in cache.downloading
-            cond = get!(cache.conds, key) do
-                Condition()
-            end
-            verbose && println("[cache] wait: ", key)
-            wait(cond)
-            if haskey(cache.map, key) && isfile(cache.map[key])
-                _lru_touch!(cache, key)
-                _save_cache(cache)
-                return cache.map[key]
-            else
-                error("Download failed for $key (woken without file present)")
-            end
+    # Wait path as another thread is already downloading this key
+    should_wait = lock(cache.lock) do
+        key in cache.downloading
+    end
+
+    if should_wait
+        cond = lock(cache.lock) do
+            get!(cache.conds, key, Condition())
         end
+        @debug "Waiting for concurrent download" key=key
+        wait(cond)
+        result = lock(cache.lock) do
+            haskey(cache.map, key) && isfile(cache.map[key]) ? cache.map[key] : nothing
+        end
+        result !== nothing && return result
+        error("Download by another thread failed for $key")
+    end
 
+    lock(cache.lock) do
         push!(cache.downloading, key)
-        cache.conds[key] = get(cache.conds, key, Condition())
+        get!(cache.conds, key, Condition())
     end
 
     tmp_path = local_path * ".part"
     mkpath(dirname(local_path))
-    verbose && println("[cache] get:  s3://$bucket/$key -> ", local_path)
+    verbose && @info "Downloading" bucket=bucket key=key
 
     ok = false
     bytes_written::Int64 = 0
 
-    # First try S3 streaming
     try
         io = AWSS3.s3_get(aws, bucket, key; return_stream=true)
         open(tmp_path, "w") do f
             while !eof(io)
-                chunk = read(io, 1_048_576)  # 1 MiB
+                chunk = read(io, 1_048_576)
                 write(f, chunk)
                 bytes_written += sizeof(chunk)
             end
         end
         ok = true
-    catch
-        # Fallback HTTP streaming with timeout
+    catch err
+        @debug "S3 download failed; trying HTTP" key=key exception=(err, catch_backtrace())
         try
-            url = "https://$bucket.s3.amazonaws.com/$key"
+            url = "https://$(bucket).s3.amazonaws.com/$(key)"
             HTTP.open(:GET, url; readtimeout=60) do http_io
                 open(tmp_path, "w") do f
                     while !eof(http_io)
@@ -418,43 +406,28 @@ function _cache_get_file!(cache::_FileCache, aws::AWS.AWSConfig, bucket::String,
                 end
             end
             ok = true
-        catch
-            ok = false
+        catch err2
+            @debug "HTTP fallback failed" key=key exception=(err2, catch_backtrace())
         end
     end
 
-    # atomically move into place if successful
-    if ok
-        mv(tmp_path, local_path; force=true)
-    else
-        # cleanup temp
-        isfile(tmp_path) && rm(tmp_path; force=true)
-    end
+    ok && isfile(tmp_path) && mv(tmp_path, local_path; force=true)
+    isfile(tmp_path) && rm(tmp_path; force=true)
 
     lock(cache.lock) do
-        # notify and clear downloading flag regardless of success
         if haskey(cache.conds, key)
             notify(cache.conds[key]; all=true)
             delete!(cache.conds, key)
         end
         delete!(cache.downloading, key)
 
-        if !ok || !isfile(local_path)
-            error("Failed to download s3://$bucket/$key")
-        end
+        ok && isfile(local_path) || error("Failed to download s3://$(bucket)/$(key)")
 
-        # record size
-        sz = try
-            filesize(local_path)
-        catch
-            bytes_written > 0 ? bytes_written : 0
-        end
-
-        cache.map[key] = local_path
+        sz = try filesize(local_path) catch; max(bytes_written, 0) end
+        cache.map[key]   = local_path
         cache.sizes[key] = sz
-        cache.bytes += sz
+        cache.bytes     += sz
         _lru_touch!(cache, key)
-
         _evict_until_under_budget!(cache)
         _save_cache(cache)
 
@@ -484,7 +457,7 @@ Joins `cache_dir` and S3 `key` using a normalised path whilst keeping the
 remote directory structure (e.g. `v1.2/wfs...`).
 """
 _cache_path(cache_dir::AbstractString, key::AbstractString) =   
-    normpath(joinpath(cache_dir, key))  # preserves v1.2/…/… structure
+    normpath(joinpath(cache_dir, key))  # keeps v1.2/…/… structure
 
 """
     _download_to_cache(aws, bucket, key; cache_dir=DEFAULT_CACHE_DIR,
@@ -499,22 +472,6 @@ function _download_to_cache(aws::AWS.AWSConfig, bucket::String, key::String;
                             verbose::Bool=true) 
     cache = _get_cache(cache_dir, cache_max_bytes)
     return _cache_get_file!(cache, aws, bucket, key; verbose=verbose)
-end
-
-"""
-    _open_nc_from_s3(aws, bucket, key; cache_dir=DEFAULT_CACHE_DIR)
-
-Opens the NetCDF from local cache if present, otherwise downloads from S3 into cache.
-Returns `(ds, path)`; Caller must `close(ds)` when done. The cache file is kept for reuse.
-"""
-function _open_nc_from_s3(aws::AWS.AWSConfig, bucket::String, key::String;
-                          cache_dir::AbstractString=DEFAULT_CACHE_DIR,
-                          cache_max_bytes::Int=2_000_000_000)
-    local_path = _download_to_cache(aws, bucket, key;
-                                    cache_dir=cache_dir,
-                                    cache_max_bytes=cache_max_bytes,
-                                    verbose=true)
-    return NCDataset(local_path, "r"), local_path
 end
 
 """
@@ -572,7 +529,7 @@ function _geos_download_to_cache(itp::GEOSFPInterpolator, dt::DateTime; verbose:
     tmp_path = local_path * ".part"
     mkpath(dirname(local_path))
 
-    verbose && println("[geos] get: ", url, " -> ", local_path)
+    verbose && @info "Downloading GEOS-FP file" url=url dest=local_path
 
     ok = false
     try
@@ -635,35 +592,27 @@ function _get_cached_filepair(product::String, dt::DateTime)
     end
 end
 
-# # GRID CACHING (AVOID RE-LOADING NETCDF DATA)
-# const _GRID_CACHE = Dict{String, Tuple}()
-# const _GRID_CACHE_LOCK = ReentrantLock()
-# const _GRID_360_CACHE = Dict{UInt64, Bool}()
-# const _GRID_360_LOCK = ReentrantLock()
-# const _MAX_GRID_CACHE_SIZE = 20  # Keep last 20 file grids in RAM
-
 # GRID CACHING
 # Struct to hold coordinate info instead of full data arrays
 struct GridMetadata
     lon::Vector{Float64}
     lat::Vector{Float64}
     z::Vector{Float64}
-    ds::NCDataset 
+    ds::NCDataset
     varname::String
-    
     scale_factor::Float64
     add_offset::Float64
     fill_values::Set{Float64}
-    
     dim_map::Dict{Symbol, Int}
     ndims::Int
+    lon_is_360::Bool 
 end
 
 const _GRID_CACHE = Dict{String, GridMetadata}()
 const _GRID_CACHE_LOCK = ReentrantLock()
 const _GRID_360_CACHE = Dict{UInt64, Bool}()
 const _GRID_360_LOCK = ReentrantLock()
-const _MAX_GRID_CACHE_SIZE = 100  # Increased capacity from 20 to 100 since we are only using metadata now instead of full data arrays
+const _MAX_GRID_CACHE_SIZE = 100  # Increased capacity from 20 to 100 since we are only using metadata instead of full data arrays
 
 function _get_cached_metadata(file_path::String, ds::NCDataset, varname::String)
     """Get or load lightweight metadata with caching"""
@@ -811,7 +760,7 @@ end
 
 Parse ...YYYYMMDD_HHMMSS.nc at the end of the key
 """
-_parse_valid_time_from_key(key::AbstractString) = let m = match(r"(\d{8})_(\d{6})\.nc$", key)
+_parse_valid_time_from_key(key::AbstractString) = let m = match(_VALID_TIME_REGEX, key)
     m === nothing && return nothing
     ymd, hms = m.captures
     DateTime(parse(Int, ymd[1:4]), parse(Int, ymd[5:6]), parse(Int, ymd[7:8]),
@@ -823,7 +772,7 @@ function _decode_time_units(ds::NCDataset, tname::String, t::AbstractVector)
     cal   = lowercase(string(get(ds[tname].attrib, "calendar", "gregorian")))
     m = match(r"(seconds|minutes|hours|days)\s+since\s+(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2}))?", units)
     if m === nothing
-        return t, nothing, nothing  # keep axis as already provided (often DateTime)
+        return t, nothing, nothing  
     end
     scale = m.captures[1]
     epoch_date = Date(m.captures[2])
@@ -849,13 +798,13 @@ function _encode_query_time(dtq::DateTime,
     # If scale missing, default to days
     s = scale === nothing ? "days" : lowercase(String(scale))
 
-    if startswith(s, "sec")       # "seconds since ..."
+    if startswith(s, "sec")       
         return delta_ms / 1_000
-    elseif startswith(s, "min")   # "minutes since ..."
+    elseif startswith(s, "min")  
         return delta_ms / 60_000
-    elseif startswith(s, "hour")  # "hours since ..."
+    elseif startswith(s, "hour")  
         return delta_ms / 3_600_000
-    else                          # treat anything else as "days since ..."
+    else                         
         return delta_ms / 86_400_000
     end
 end
@@ -943,7 +892,8 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
         key = _construct_s3_key(dt_file, product)
         try
             return _ensure_local(key)
-        catch
+        catch err
+            @debug "Could not fetch WAM-IPE product file" key=key product=product exception=(err, catch_backtrace())
             return nothing
         end
     end
@@ -954,7 +904,8 @@ function _get_two_files_exact(itp::WAMInterpolator, dt::DateTime)
             key = _construct_wrs_key_with_cycle(dt_file, arch)
             try
                 return _ensure_local(key)
-            catch
+            catch err
+                @debug "Could not fetch WRS cycle file" key=key archive=arch exception=(err, catch_backtrace())
                 return nothing
             end
         end
@@ -1028,7 +979,8 @@ function _try_download(itp::WAMInterpolator, dt::DateTime, product::String)
 
     try
         return _download_to_cache(aws, itp.bucket, key; cache_dir=DEFAULT_CACHE_DIR, verbose=true)
-    catch
+    catch err
+        @debug "Could not download WAM-IPE file" key=key product=product exception=(err, catch_backtrace())
         return nothing
     end
 end
@@ -1063,23 +1015,6 @@ function _geos_altitude_bounds(itp::GEOSFPInterpolator, dt::DateTime)
         _unpin_nc_cached(p_lo)
         _unpin_nc_cached(p_hi)
     end
-end
-
-function _pick_file(objs::AbstractVector; target_dt::Union{DateTime,Nothing}=nothing)
-    isempty(objs) && return nothing
-    if target_dt === nothing
-        return sort(objs, by = o -> String(o["Key"]))[end]
-    end
-
-    # Build (delta, key, obj) so ties on delta break by lexicographically latest key
-    scored = map(objs) do o
-        key = String(o["Key"])
-        vt  = _parse_valid_time_from_key(key)
-        delta   = vt === nothing ? Day(9999) : abs(target_dt - vt)
-        (delta, key, o)
-    end
-    _, idx = findmin(scored)
-    return scored[idx][3]   # the `o`
 end
 
 # NETCDF DATA LOADING AND CF CONVENTIONS
@@ -1283,6 +1218,9 @@ function _load_grids(ds::NCDataset, varname::String; file_time::Union{DateTime,N
         if !occursin("degrees_east", lonunits)
             @warn "Longitude units are '$lonunits' (expected degrees_east). Results may be incorrect."
         end
+        lon_is_360 = maximum(lon) > 180.0
+
+        return GridMetadata(lon, lat, z, ds, varname, sf, ao, fillvals, dim_map, nd, lon_is_360)
 
         return lat, lon, z, t, V, (latname, lonname, zname, tname)
 
@@ -1322,11 +1260,31 @@ function _load_grid_metadata(ds::NCDataset, varname::String)
     idx_z    = findfirst(==( :z   ), roles)
     idx_time = findfirst(==( :time ), roles)
 
+    idx_lon === nothing && error("Could not find longitude dimension for '$varname'. dims=$(dnames) roles=$(roles)")
+    idx_lat === nothing && error("Could not find latitude dimension for '$varname'. dims=$(dnames) roles=$(roles)")
+    idx_z   === nothing && error("Could not find vertical dimension for '$varname'. dims=$(dnames) roles=$(roles)")
+
     get_coord = (i) -> haskey(ds, dnames[i]) ? Float64.(collect(ds[dnames[i]][:])) : collect(1.0:1.0:float(size(v, i)))
     
     lon = get_coord(idx_lon)
     lat = get_coord(idx_lat)
-    z   = get_coord(idx_z)
+    z_raw = get_coord(idx_z)
+    zname = dnames[idx_z]
+    z_units = haskey(ds, zname) ? get(ds[zname].attrib, "units", "km") : "km"
+    z_kind = _classify_vertical_units(String(z_units))
+    z = if z_kind === :km
+        Float64.(z_raw)
+    elseif z_kind === :m
+        Float64.(z_raw) ./ 1000.0
+    elseif z_kind === :pressure
+        error("Vertical axis '$zname' uses pressure units ('$z_units'); cannot convert to altitude in km.")
+    elseif z_kind === :index
+        error("Vertical axis '$zname' has index/level units ('$z_units'); cannot convert to altitude in km.")
+    elseif z_kind === :missing
+        error("Vertical axis '$zname' is missing a 'units' attribute; cannot safely convert to altitude in km.")
+    else
+        error("Unsupported vertical units '$z_units' on '$zname'. Expected kilometres ('km') or metres ('m').")
+    end
     
     attrs_any = try Dict(v.attrib) catch; Dict(CommonDataModel.attributes(v)) end
     sf = haskey(attrs_any, "scale_factor") ? float(attrs_any["scale_factor"]) : 1.0
@@ -1362,6 +1320,8 @@ function _decode_value(val::Float64, meta::GridMetadata)
 end
 
 function _get_density_wam_core(meta::GridMetadata, lon_q::Float64, lat_q::Float64, z_q::Float64)
+    lon_q = meta.lon_is_360 && lon_q < 0.0 ? lon_q + 360.0 : lon_q
+
     function get_bracket(arr, val)
         n = length(arr)
         if val <= arr[1]; return (1, 2); end
@@ -1374,35 +1334,33 @@ function _get_density_wam_core(meta::GridMetadata, lon_q::Float64, lat_q::Float6
     jl, jh = get_bracket(meta.lat, lat_q)
     kl, kh = get_bracket(meta.z, z_q)
 
-    ranges = Vector{Union{Colon, UnitRange{Int}}}(undef, meta.ndims)
-    
-    for i in 1:meta.ndims
-        if haskey(meta.dim_map, :lon) && meta.dim_map[:lon] == i
-            ranges[i] = il:ih
-        elseif haskey(meta.dim_map, :lat) && meta.dim_map[:lat] == i
-            ranges[i] = jl:jh
-        elseif haskey(meta.dim_map, :z) && meta.dim_map[:z] == i
-            ranges[i] = kl:kh
+    idx = Vector{Any}(undef, meta.ndims)
+    for d in 1:meta.ndims
+        if get(meta.dim_map, :lon, 0) == d
+            idx[d] = il:ih
+        elseif get(meta.dim_map, :lat, 0) == d
+            idx[d] = jl:jh
+        elseif get(meta.dim_map, :z, 0) == d
+            idx[d] = kl:kh
         else
-            ranges[i] = Colon()
+            idx[d] = 1:1
         end
     end
 
-    # Read Tiny Slice (2x2x2)
     try
-        raw_slice = meta.ds[meta.varname][ranges...]
-        
-        perm = Int[]
-        if haskey(meta.dim_map, :lon) push!(perm, meta.dim_map[:lon]) end
-        if haskey(meta.dim_map, :lat) push!(perm, meta.dim_map[:lat]) end
-        if haskey(meta.dim_map, :z) push!(perm, meta.dim_map[:z]) end
-        
-        data = length(perm) == 3 ? Array(PermutedDimsArray(raw_slice, (perm...,))) : raw_slice
-        
+        raw = meta.ds[meta.varname][idx...]
         v = Array{Float64}(undef, 2, 2, 2)
-        for idx in CartesianIndices(data)
-            val = data[idx]
-            v[idx] = _decode_value(ismissing(val) ? NaN : Float64(val), meta)
+        lon_dim = meta.dim_map[:lon]
+        lat_dim = meta.dim_map[:lat]
+        z_dim = meta.dim_map[:z]
+
+        for li in 1:2, lj in 1:2, lk in 1:2
+            raw_idx = ones(Int, meta.ndims)
+            raw_idx[lon_dim] = li
+            raw_idx[lat_dim] = lj
+            raw_idx[z_dim] = lk
+            val = raw[raw_idx...]
+            v[li, lj, lk] = _decode_value(ismissing(val) ? NaN : Float64(val), meta)
         end
 
         x = (lon_q - meta.lon[il]) / (meta.lon[ih] - meta.lon[il])
@@ -1419,7 +1377,8 @@ function _get_density_wam_core(meta::GridMetadata, lon_q::Float64, lat_q::Float6
         # Interpolate X
         return c0 * (1-x) + c1 * x
 
-    catch e
+    catch err
+        @debug "Error in WAM-IPE micro-slice interpolation" exception=(err, catch_backtrace())
         return NaN
     end
 end
@@ -1460,9 +1419,7 @@ function _z_to_km(z::AbstractVector, ds::NCDataset, zname::String)
     end
 end
 
-# =========================
 # GEOS-FP NETCDF LOAD HELPERS
-# =========================
 
 """
     _geos_classify_dim(dname, ds) returns Symbol
@@ -1512,7 +1469,6 @@ function _geos_dim_indices(ds::NCDataset, varname::String)
     v = ds[varname]
     dnames = String.(NCDatasets.dimnames(v))
 
-    # Build a case-insensitive name → index map
     lname_to_idx = Dict(lowercase(name) => i for (i, name) in pairs(dnames))
 
     # Try exact canonical GEOS dim names first (lon, lat, lev, time)
@@ -1588,48 +1544,6 @@ function _geos_level_pressure_pa(ds::NCDataset, itp::GEOSFPInterpolator)
     else
         error("Unsupported GEOS pressure-level units '$units' on $(itp.lev_varname)")
     end
-end
-
-"""
-    _geos_get_height4(ds, itp, idx_lon, idx_lat, idx_z, idx_time, dnames, shape_ref)
-
-Try to load a 4-D geometric height field and return it in metres, permuted to
-(lon, lat, z, time). Returns `nothing` if not available.
-"""
-function _geos_get_height4(ds::NCDataset,
-                           itp::GEOSFPInterpolator,
-                           idx_lon::Int, idx_lat::Int, idx_z::Int, idx_time::Int,
-                           dnames::Vector{String},
-                           shape_ref::NTuple{4,Int})
-
-    candidates = String[]
-    if !isempty(itp.z_varname)
-        push!(candidates, itp.z_varname)
-    end
-    append!(candidates, ["H", "Z", "HEIGHT", "h", "ght"])
-
-    for zname in candidates
-        if haskey(ds, zname)
-            raw = _cf_decode!(ds[zname][:], ds[zname])
-            ndims(raw) == 4 || continue
-
-            z_idx_lon, z_idx_lat, z_idx_z, z_idx_time, _ = _geos_dim_indices(ds, zname)
-            z4 = _geos_permute4(raw, z_idx_lon, z_idx_lat, z_idx_z, z_idx_time)
-
-            if size(z4) == shape_ref
-                attrs = Dict(ds[zname].attrib)
-                units = lowercase(string(get(attrs, "units", "")))
-
-                if occursin(r"\bkm\b", units) || occursin("kilometer", units) || occursin("kilometre", units)
-                    return z4 .* 1000.0
-                else
-                    return z4
-                end
-            end
-        end
-    end
-
-    return nothing
 end
 
 """
@@ -1743,39 +1657,38 @@ This implementation is specifically for the pressure-level product:
 """
 function _geos_load_grids(ds::NCDataset, itp::GEOSFPInterpolator; file_time::Union{DateTime,Nothing}=nothing)
 
-    # ---- T ----
+    # T 
     # Use ds[var][:] which gives correct Julia-order array matching dimnames order.
     # NCDatasets applies CF decoding (scale/offset/fill→missing) automatically.
-    # We just need to convert missing→NaN ourselves.
     idx_lon, idx_lat, idx_z, idx_time, dnames = _geos_dim_indices(ds, itp.t_varname)
 
     T = _geos_read_var(ds, itp.t_varname)
     T = _geos_permute4(T, idx_lon, idx_lat, idx_z, idx_time)
 
-    # ---- QV ----
+    # QV 
     qv_il, qv_ia, qv_iz, qv_it, _ = _geos_dim_indices(ds, itp.qv_varname)
     QV = _geos_read_var(ds, itp.qv_varname)
     QV = _geos_permute4(QV, qv_il, qv_ia, qv_iz, qv_it)
 
-    # ---- H ----
+    # H 
     h_il, h_ia, h_iz, h_it, _ = _geos_dim_indices(ds, itp.z_varname)
     H = _geos_read_var(ds, itp.z_varname)
     H = _geos_permute4(H, h_il, h_ia, h_iz, h_it)
 
-    # ---- size checks ----
+    # size checks 
     nz = size(T, 3)
     size(T) == size(QV) || error("T shape $(size(T)) != QV shape $(size(QV))")
     size(H, 3) == nz    || error("H vertical size $(size(H,3)) != T vertical size $nz")
 
-    @info "GEOS raw shapes" T=size(T) QV=size(QV) H=size(H)
+    @debug "GEOS raw shapes" T=size(T) QV=size(QV) H=size(H)
 
-    # ---- pressure ----
+    # pressure
     p_lev = _geos_level_pressure_pa(ds, itp)
     length(p_lev) == nz || error("Pressure-level length $(length(p_lev)) != T vertical size $nz. " *
         "T dimnames=$(dnames), idx_lon=$idx_lon, idx_lat=$idx_lat, idx_z=$idx_z, idx_time=$idx_time, " *
         "size(ds[T][:])=$(size(ds[itp.t_varname][:]))")
 
-    # ---- altitude axis in km ----
+    # altitude axis in km 
     h_attrs = Dict(ds[itp.z_varname].attrib)
     h_units = lowercase(string(get(h_attrs, "units", "m")))
     h_scale = occursin("km", h_units) ? 1.0 : 1.0/1000.0
@@ -1792,13 +1705,13 @@ function _geos_load_grids(ds::NCDataset, itp::GEOSFPInterpolator; file_time::Uni
     if any(!isfinite, z_km)
     error("GEOS z_km still contains non-finite values after fill.")
     end
-    # ---- density ----
+    # density 
     P  = reshape(p_lev, 1, 1, nz, 1)
     P  = repeat(P, size(T,1), size(T,2), 1, size(T,4))
     Tv = T .* (1 .+ 0.61 .* QV)
     V  = P ./ (R_D_GEOS .* Tv)
 
-    # ---- coordinate vectors ----
+    # coordinate vectors 
     lonname = dnames[idx_lon]
     latname = dnames[idx_lat]
     zname   = dnames[idx_z]
@@ -1808,7 +1721,7 @@ function _geos_load_grids(ds::NCDataset, itp::GEOSFPInterpolator; file_time::Uni
     lat = _geos_coord_vector(ds, latname, size(T, 2))
     t   = _geos_coord_vector(ds, tname,   size(T, 4))
 
-    @info "GEOS z range" zmin=minimum(z_km) zmax=maximum(z_km)
+    @debug "GEOS z range" zmin=minimum(z_km) zmax=maximum(z_km)
 
     if !issorted(z_km)
         perm_z = sortperm(z_km)
@@ -1955,25 +1868,25 @@ end
 
 # SciML vertical helper (quadratic in log(z) on log(values))
 # Uses DataInterpolations.jl; falls back to linear in log-space or constants if needed.
-# function _sciml_quad_logz(z::AbstractVector, v::AbstractVector, zq::Real)
-#     # keep only strictly positive, finite pairs (required for log)
-#     mask = (z .> 0) .& isfinite.(z) .& (v .> 0) .& isfinite.(v)
-#     z_ok = z[mask]; v_ok = v[mask]
+function _sciml_quad_logz(z::AbstractVector, v::AbstractVector, zq::Real)
+    # keep only strictly positive, finite pairs (required for log)
+    mask = (z .> 0) .& isfinite.(z) .& (v .> 0) .& isfinite.(v)
+    z_ok = z[mask]; v_ok = v[mask]
 
-#     if length(z_ok) == 0
-#         return NaN
-#     elseif length(z_ok) == 1
-#         return v_ok[1]
-#     elseif length(z_ok) == 2
-#         # linear in log-space between two nearest
-#         itp = DataInterpolations.LinearInterpolation(log.(v_ok), log.(z_ok))
-#         return exp(itp(log(zq)))
-#     else
-#         # quadratic in log-space using all available points
-#         itp = DataInterpolations.QuadraticSpline(log.(v_ok), log.(z_ok))
-#         return exp(itp(log(zq)))
-#     end
-# end
+    if length(z_ok) == 0
+        return NaN
+    elseif length(z_ok) == 1
+        return v_ok[1]
+    elseif length(z_ok) == 2
+        # linear in log-space between two nearest
+        itp = DataInterpolations.LinearInterpolation(log.(v_ok), log.(z_ok))
+        return exp(itp(log(zq)))
+    else
+        # quadratic in log-space using all available points
+        itp = DataInterpolations.QuadraticSpline(log.(v_ok), log.(z_ok))
+        return exp(itp(log(zq)))
+    end
+end
 
 function _sciml_quad_logz(z::AbstractVector, v::AbstractVector, zq::Real)
     mask = (z .> 0) .& isfinite.(z) .& (v .> 0) .& isfinite.(v)
@@ -1995,7 +1908,7 @@ function _sciml_quad_logz(z::AbstractVector, v::AbstractVector, zq::Real)
     zq_clamped = clamp(float(zq), first(z_ok), last(z_ok))
     
     if zq != zq_clamped
-        @info "Clamped WAM altitude request" requested_km=zq used_km=zq_clamped zmin=first(z_ok) zmax=last(z_ok)
+        @debug "Clamped WAM altitude request" requested_km=zq used_km=zq_clamped zmin=first(z_ok) zmax=last(z_ok)
     end
 
     if length(z_ok) == 2
@@ -2156,41 +2069,61 @@ end
 Choose which backend should answer the query based on altitude.
 """
 @inline function _select_backend(itp::HybridDensityInterpolator, dt::DateTime, alt_km::Real)
-    if alt_km > itp.msis_max_alt_km
-        return :wam
+    alt_km > itp.msis_max_alt_km && return :wam
+
+    cache_key = _datetime_floor_3hr(dt)
+
+    # Thread-safe read
+    bounds = lock(_GEOS_BOUNDS_LOCK) do
+        get(itp.geos_bounds_cache, cache_key, nothing)
     end
 
-    geos_zmin, geos_zmax = get!(itp.geos_bounds_cache, dt) do
-        _geos_altitude_bounds(itp.geos, dt)
+    if bounds === nothing
+        # Compute outside the lock (this is I/O-heavy and re-entrant)
+        bounds = _geos_altitude_bounds(itp.geos, dt)
+        lock(_GEOS_BOUNDS_LOCK) do
+            itp.geos_bounds_cache[cache_key] = bounds
+        end
     end
 
-    if geos_zmin <= alt_km <= geos_zmax
-        return :geos
-    else
-        return :msis
-    end
+    geos_zmin, geos_zmax = bounds
+    return geos_zmin <= alt_km <= geos_zmax ? :geos : :msis
 end
+
 # PUBLIC API - DENSITY RETRIEVAL
 
-# =========================
 # GEOS-FP DENSITY INTERPOLATION HELPERS
-# =========================
+function _get_cached_geos_grids(file_path::String, ds::NCDataset,
+                                 itp::GEOSFPInterpolator,
+                                 file_time::Union{DateTime,Nothing})
+    lock(_GEOS_GRID_CACHE_LOCK) do
+        if haskey(_GEOS_GRID_CACHE, file_path)
+            return _GEOS_GRID_CACHE[file_path]
+        end
+        result = _geos_load_grids(ds, itp; file_time=file_time)
+        _GEOS_GRID_CACHE[file_path] = result
+        if length(_GEOS_GRID_CACHE) > _MAX_GEOS_GRID_CACHE
+            delete!(_GEOS_GRID_CACHE, first(keys(_GEOS_GRID_CACHE)))
+        end
+        return result
+    end
+end
 
 """
     _geos_interp_density_from_loaded(ds, itp, dt, latq, lonq, alt_km, mode)
 
 Evaluate density from one already-open GEOS dataset.
 """
-function _geos_interp_density_from_loaded(ds::NCDataset,
+function _geos_interp_density_from_loaded(file_path::String,
+                                          ds::NCDataset,
                                           itp::GEOSFPInterpolator,
                                           dt::DateTime,
-                                          latq::Real,
-                                          lonq::Real,
-                                          alt_km::Real,
-                                          mode::Symbol)
+                                          latq::Real, lonq::Real,
+                                          alt_km::Real, mode::Symbol)
 
     lat, lon, z, t, V, (latname, lonname, zname, tname) =
-        _geos_load_grids(ds, itp; file_time=dt)
+    _get_cached_geos_grids(file_path, ds, itp, dt)
+
 
     tdts, epoch, scale = _decode_time_units(ds, tname, t)
     tq = (epoch === nothing) ? dt : _encode_query_time(dt, epoch, scale)
@@ -2214,38 +2147,26 @@ end
 Return neutral density at (`dt`, `lat`, `lon`, `alt_km`) using WAM‑IPE outputs.
 """
 function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
-    mode = _validate_query_args(itp.interpolation, dt, latq, lonq, alt_km)
+    _validate_query_args(itp.interpolation, dt, latq, lonq, alt_km)
 
-    # 1) Find local cached file paths (does S3 download if missing)
     p_lo, p_hi, prod_lo, prod_hi = _get_two_files_exact(itp, dt)
     @debug "[fetch] Using files: low=[$(prod_lo)] $(basename(p_lo)), high=[$(prod_hi)] $(basename(p_hi))"
 
-    # 2) Open via pooled handles (pin); do NOT close—just unpin in finally
     ds_lo = _open_nc_cached(p_lo)
     ds_hi = _open_nc_cached(p_hi)
 
-    # 3) Parse valid times (YYYYMMDD_HHMMSS from filename)
     t_lo = _parse_valid_time_from_key(p_lo)
     t_hi = _parse_valid_time_from_key(p_hi)
     t_lo === nothing && (t_lo = t_hi)
     t_hi === nothing && (t_hi = t_lo)
 
     try
-        lat, lon, z, t, V, (latname, lonname, zname, tname) =
-    _get_cached_grids(p_lo, ds_lo, itp.varname, t_lo)
-        tdts, epoch, scale = _decode_time_units(ds_lo, tname, t)
-        tq_lo = (epoch === nothing) ? t_lo : _encode_query_time(t_lo, epoch, scale)
-        zq_lo = _maybe_convert_alt(z, alt_km, ds_lo, zname)
-        v_lo  = _interp4(lat, lon, z, tdts, V, latq, lonq, zq_lo, tq_lo; mode=mode)
+        meta_lo = _get_cached_metadata(p_lo, ds_lo, itp.varname)
+        meta_hi = _get_cached_metadata(p_hi, ds_hi, itp.varname)
 
-        lat2, lon2, z2, t2, V2, (latname2, lonname2, zname2, tname2) =
-    _get_cached_grids(p_hi, ds_hi, itp.varname, t_hi)
-        tdts2, epoch2, scale2 = _decode_time_units(ds_hi, tname2, t2)
-        tq_hi = (epoch2 === nothing) ? t_hi : _encode_query_time(t_hi, epoch2, scale2)
-        zq_hi = _maybe_convert_alt(z2, alt_km, ds_hi, zname2)
-        v_hi  = _interp4(lat2, lon2, z2, tdts2, V2, latq, lonq, zq_hi, tq_hi; mode=mode)
+        v_lo = _get_density_wam_core(meta_lo, Float64(lonq), Float64(latq), Float64(alt_km))
+        v_hi = _get_density_wam_core(meta_hi, Float64(lonq), Float64(latq), Float64(alt_km))
 
-        # 4) Temporal blend at query dt
         if t_lo == t_hi
             return float(v_lo)
         else
@@ -2256,7 +2177,6 @@ function get_density(itp::WAMInterpolator, dt::DateTime, latq::Real, lonq::Real,
         end
 
     finally
-        # unpin (keeps files open in pool for reuse)
         _unpin_nc_cached(p_lo)
         _unpin_nc_cached(p_hi)
     end
@@ -2285,10 +2205,8 @@ This backend is intended for use between 0 and 70 km.
 function get_density(itp::GEOSFPInterpolator, dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
     mode = _validate_query_args_geos(itp, dt, latq, lonq, alt_km)
 
-    # 1) Resolve/cached bracketing files
     p_lo, p_hi, t_lo, t_hi = _geos_get_two_files_exact(itp, dt)
 
-    # 2) Open via pooled handles
     ds_lo = _open_nc_cached(p_lo)
     ds_hi = _open_nc_cached(p_hi)
 
@@ -2296,7 +2214,6 @@ function get_density(itp::GEOSFPInterpolator, dt::DateTime, latq::Real, lonq::Re
         v_lo = _geos_interp_density_from_loaded(ds_lo, itp, t_lo, latq, lonq, alt_km, mode)
         v_hi = _geos_interp_density_from_loaded(ds_hi, itp, t_hi, latq, lonq, alt_km, mode)
 
-        # 3) Temporal blend
         if t_lo == t_hi
             return float(v_lo)
         else
@@ -2330,6 +2247,62 @@ function get_density(itp::HybridDensityInterpolator, dt::DateTime, latq::Real, l
     else
         return get_density(itp.wam, dt, latq, lonq, alt_km)
     end
+end
+
+function _get_default_itp()
+    if _DEFAULT_ITP[] === nothing
+        _DEFAULT_ITP[] = HybridDensityInterpolator()
+    end
+    return _DEFAULT_ITP[]
+end
+
+"""
+    density(dt, lat, lon, alt; alt_unit=:km, angles_in=:deg) -> Float64
+
+Return neutral atmospheric density [kg/m^3] using the default hybrid backend.
+"""
+function density(dt::DateTime, lat::Real, lon::Real, alt::Real;
+                 alt_unit::Symbol=:km, angles_in::Symbol=:deg)
+    angles_in in (:deg, :rad) ||
+        throw(ArgumentError("angles_in must be :deg or :rad; got $angles_in"))
+    alt_unit in (:km, :m) ||
+        throw(ArgumentError("alt_unit must be :km or :m; got $alt_unit"))
+
+    lat_d = angles_in === :rad ? rad2deg(Float64(lat)) : Float64(lat)
+    lon_d = angles_in === :rad ? rad2deg(Float64(lon)) : Float64(lon)
+    alt_km = alt_unit === :m ? Float64(alt) / 1000.0 : Float64(alt)
+    return get_density(_get_default_itp(), dt, lat_d, lon_d, alt_km)
+end
+
+density(dt::AbstractString, lat::Real, lon::Real, alt::Real; kwargs...) =
+    density(DateTime(dt), lat, lon, alt; kwargs...)
+
+"""
+    leo_config() -> HybridDensityInterpolator
+
+Return a hybrid configuration for LEO drag calculations.
+"""
+function leo_config()
+    return HybridDensityInterpolator(
+        wam = WAMInterpolator(interpolation=:sciml),
+        msis = NRLMSISEInterpolator(min_alt_km=0.0, max_alt_km=130.0),
+        geos = GEOSFPInterpolator(interpolation=:sciml, max_alt_km=70.0),
+        msis_max_alt_km = 130.0,
+    )
+end
+
+"""
+    lower_atmo_config() -> HybridDensityInterpolator
+
+Return a hybrid configuration for lower-atmosphere work.
+"""
+function lower_atmo_config()
+    return HybridDensityInterpolator(
+        geos = GEOSFPInterpolator(interpolation=:sciml, max_alt_km=70.0),
+        msis = NRLMSISEInterpolator(min_alt_km=0.0, max_alt_km=100.0),
+        wam = WAMInterpolator(interpolation=:sciml),
+        msis_max_alt_km = 70.0,
+    )
 end
 
 """
@@ -2409,26 +2382,35 @@ function get_density_batch(itp::HybridDensityInterpolator,
     return results
 end
 
+"""
+    get_density_batch!(itp, dts, lats, lons, alts_km, out) -> out
+
+Fill a pre-allocated output vector with density values.
+"""
+function get_density_batch!(itp, dts::AbstractVector{<:DateTime},
+                            lats::AbstractVector, lons::AbstractVector,
+                            alts_km::AbstractVector, out::AbstractVector{Float64})
+    n = length(dts)
+    @assert length(out) >= n "Output buffer too small"
+    @assert length(lats) == n
+    @assert length(lons) == n
+    @assert length(alts_km) == n
+
+    Threads.@threads for i in 1:n
+        @inbounds out[i] = get_density(itp, dts[i], lats[i], lons[i], alts_km[i])
+    end
+    return out
+end
+
 function get_density_from_key(itp::WAMInterpolator, key::AbstractString,
                               dt::DateTime, latq::Real, lonq::Real, alt_km::Real)
-    mode = _normalise_interp(itp.interpolation)
-
-    # Ensure the file is present in on-disc cache; get local path
     aws = _aws_cfg(itp.region)
     local_path = _download_to_cache(aws, itp.bucket, String(key); cache_dir=DEFAULT_CACHE_DIR, verbose=true)
 
-    # Open via pooled handles and unpin after
     ds = _open_nc_cached(local_path)
     try
-        t_file = _parse_valid_time_from_key(String(key))
-        lat, lon, z, t, V, (latname, lonname, zname, tname) =
-            _load_grids(ds, itp.varname; file_time=t_file)
-
-        tdts, epoch, scale = _decode_time_units(ds, tname, t)
-        tq = (epoch === nothing) ? (t_file === nothing ? dt : t_file) : _encode_query_time(dt, epoch, scale)
-
-        zq = _maybe_convert_alt(z, alt_km, ds, zname)
-        return _interp4(lat, lon, z, tdts, V, latq, lonq, zq, tq; mode=mode)
+        meta = _get_cached_metadata(local_path, ds, itp.varname)
+        return _get_density_wam_core(meta, Float64(lonq), Float64(latq), Float64(alt_km))
     finally
         _unpin_nc_cached(local_path)
     end
@@ -2555,7 +2537,6 @@ function get_density_trajectory(itp::WAMInterpolator,
     @assert length(lons)    == n "lons length must match dts"
     @assert length(alts_m)  == n "alts_m length must match dts"
 
-    # Copy into plain Float64 vectors
     latv  = Float64.(lats)
     lonv  = Float64.(lons)
     altkm = Float64.(alts_m) .* 1e-3
@@ -2683,11 +2664,19 @@ function get_density_trajectory_optimised(itp::WAMInterpolator,
         end
     end
     
-    # Group queries by which file pair they need
     file_groups = Dict{Tuple{String,String}, Vector{Int}}()
-    for i in 1:n
-        p_lo, p_hi, _, _ = _get_two_files_exact(itp, dts[i])
-        key = (p_lo, p_hi)
+    sorted_idx = sortperm(dts, by=_datetime_floor_10min)
+    last_bucket = DateTime(0)
+    last_key = ("", "")
+
+    for i in sorted_idx
+        bucket = _datetime_floor_10min(dts[i])
+        if bucket != last_bucket
+            p_lo, p_hi, _, _ = _get_two_files_exact(itp, dts[i])
+            last_key = (p_lo, p_hi)
+            last_bucket = bucket
+        end
+        key = last_key
         push!(get!(file_groups, key, Int[]), i)
     end
     
@@ -2699,20 +2688,13 @@ function get_density_trajectory_optimised(itp::WAMInterpolator,
         ds_hi = _open_nc_cached(p_hi)
         
         try
-            # Load grids once per file pair
             t_lo = _parse_valid_time_from_key(p_lo)
             t_hi = _parse_valid_time_from_key(p_hi)
-            
-            lat_lo, lon_lo, z_lo, t_lo_arr, V_lo, names_lo = _get_cached_grids(p_lo, ds_lo, itp.varname, t_lo)
-            lat_hi, lon_hi, z_hi, t_hi_arr, V_hi, names_hi = _get_cached_grids(p_hi, ds_hi, itp.varname, t_hi)
-            
-            tdts_lo, epoch_lo, scale_lo = _decode_time_units(ds_lo, names_lo[4], t_lo_arr)
-            tdts_hi, epoch_hi, scale_hi = _decode_time_units(ds_hi, names_hi[4], t_hi_arr)
-            
-            mode = _normalise_interp(itp.interpolation)
+            t_lo === nothing && (t_lo = t_hi)
+            t_hi === nothing && (t_hi = t_lo)
 
-            tq_lo = (epoch_lo === nothing) ? t_lo : _encode_query_time(t_lo, epoch_lo, scale_lo)
-            tq_hi = (epoch_hi === nothing) ? t_hi : _encode_query_time(t_hi, epoch_hi, scale_hi)
+            meta_lo = _get_cached_metadata(p_lo, ds_lo, itp.varname)
+            meta_hi = _get_cached_metadata(p_hi, ds_hi, itp.varname)
 
             same_time = (t_lo == t_hi)
             t_lo_val = same_time ? 0.0 : Float64(Dates.value(t_lo))
@@ -2720,11 +2702,8 @@ function get_density_trajectory_optimised(itp::WAMInterpolator,
             t_delta_inv = same_time ? 0.0 : 1.0 / (t_hi_val - t_lo_val)
 
             for idx in indices
-                zq_lo = _maybe_convert_alt(z_lo, altkm[idx], ds_lo, names_lo[3])
-                zq_hi = _maybe_convert_alt(z_hi, altkm[idx], ds_hi, names_hi[3])
-                
-                v_lo = _interp4(lat_lo, lon_lo, z_lo, tdts_lo, V_lo, latv[idx], lonv[idx], zq_lo, tq_lo; mode=mode)
-                v_hi = _interp4(lat_hi, lon_hi, z_hi, tdts_hi, V_hi, latv[idx], lonv[idx], zq_hi, tq_hi; mode=mode)
+                v_lo = _get_density_wam_core(meta_lo, lonv[idx], latv[idx], altkm[idx])
+                v_hi = _get_density_wam_core(meta_hi, lonv[idx], latv[idx], altkm[idx])
                 
                 if same_time
                     results[idx] = float(v_lo)
@@ -2878,7 +2857,7 @@ function prewarm_cache!(itp::WAMInterpolator, dts::AbstractVector{<:DateTime})
         push!(unique_files, (p_lo, p_hi))
     end
     
-    println("Pre-downloading $(length(unique_files)) unique file pairs...")
+    @info "Pre-downloaded WAM-IPE file pairs" n=length(unique_files)
     # Files are already downloaded by _get_two_files_exact
     return length(unique_files)
 end
@@ -2897,7 +2876,7 @@ function prewarm_cache!(itp::GEOSFPInterpolator, dts::AbstractVector{<:DateTime}
         push!(unique_files, (p_lo, p_hi))
     end
 
-    println("Pre-downloading $(length(unique_files)) unique GEOS-FP file pairs...")
+    @info "Pre-downloaded GEOS-FP file pairs" n=length(unique_files)
     return length(unique_files)
 end
 
@@ -2937,6 +2916,38 @@ function prewarm_cache!(itp::HybridDensityInterpolator,
     wam_count  = isempty(wam_dts)  ? 0 : prewarm_cache!(itp.wam,  wam_dts)
 
     return (geos=geos_count, msis=msis_count, wam=wam_count)
+end
+
+"""
+    clean_cache!(; cache_dir=DEFAULT_CACHE_DIR, max_age=Day(30)) -> Int
+
+Delete cache files older than `max_age`. Metadata files are preserved.
+"""
+function clean_cache!(; cache_dir::AbstractString=DEFAULT_CACHE_DIR,
+                        max_age::Period=Day(30))
+    cutoff = now() - max_age
+    count = 0
+
+    isdir(cache_dir) || return 0
+
+    for (root, _, files) in walkdir(cache_dir)
+        for file in files
+            path = joinpath(root, file)
+            endswith(path, ".bin") && continue
+            if isfile(path) && Dates.unix2datetime(mtime(path)) < cutoff
+                try
+                    rm(path; force=true)
+                    count += 1
+                    @debug "Deleted old cache file" path=path
+                catch err
+                    @warn "Could not delete cache file" path=path exception=(err, catch_backtrace())
+                end
+            end
+        end
+    end
+
+    @info "Cache cleanup complete" deleted=count dir=cache_dir
+    return count
 end
 
 # PROFILE AND PLOTTING FUNCTIONS
@@ -3198,78 +3209,14 @@ function inspect_geos_remote_file(itp::GEOSFPInterpolator, dt::DateTime)
     return path
 end
 
-function get_density_at_point(itp::WAMInterpolator, lon::Real, lat::Real, alt_km::Real, dt::DateTime)
-    p_lo, p_hi, _, _ = _get_two_files_exact(itp, dt)
-    
-    meta_lo = _get_cached_metadata(p_lo, _open_nc_cached(p_lo), itp.varname)
-    meta_hi = _get_cached_metadata(p_hi, _open_nc_cached(p_hi), itp.varname)
-    
-    dt_lo, dt_hi = _surrounding_10min(dt)
-    
-    if dt_lo == dt_hi
-        val = _get_density_wam_core(meta_lo, Float64(lon), Float64(lat), Float64(alt_km))
-    else
-        w_lo = (dt_hi - dt) / Millisecond(600)
-        w_hi = (dt - dt_lo) / Millisecond(600)
-        val_lo = _get_density_wam_core(meta_lo, Float64(lon), Float64(lat), Float64(alt_km))
-        val_hi = _get_density_wam_core(meta_hi, Float64(lon), Float64(lat), Float64(alt_km))
-        val = val_lo * w_lo + val_hi * w_hi
-    end
-
-    _unpin_nc_cached(p_lo)
-    _unpin_nc_cached(p_hi)
-    
-    return val
-end
-
-const get_density = get_density_at_point
-
-function get_density_batch(itp::WAMInterpolator, lons::AbstractVector, lats::AbstractVector, alts::AbstractVector, dts::AbstractVector{DateTime})
-    n = length(dts)
-    @assert length(lons) == length(lats) == length(alts) == n
-    results = Vector{Float64}(undef, n)
-    
-    # Group by 10-minute window to minimize file handles
-    groups = Dict{Tuple{String, DateTime}, Vector{Int}}()
-    for (i, dt) in enumerate(dts)
-        key = (itp.product, _datetime_floor_10min(dt))
-        if !haskey(groups, key); groups[key] = Int[]; end
-        push!(groups[key], i)
-    end
-    
-    for ((product, dt_floor), indices) in groups
-        p_lo, p_hi, _, _ = _get_two_files_exact(itp, dt_floor)
-        meta_lo = _get_cached_metadata(p_lo, _open_nc_cached(p_lo), itp.varname)
-        meta_hi = _get_cached_metadata(p_hi, _open_nc_cached(p_hi), itp.varname)
-        
-        dt_lo, dt_hi = _surrounding_10min(dt_floor)
-        
-        for i in indices
-            t = dts[i]
-            if dt_lo == dt_hi
-                results[i] = _get_density_wam_core(meta_lo, lons[i], lats[i], alts[i])
-            else
-                w_lo = (dt_hi - t) / Millisecond(600)
-                w_hi = (t - dt_lo) / Millisecond(600)
-                v_lo = _get_density_wam_core(meta_lo, lons[i], lats[i], alts[i])
-                v_hi = _get_density_wam_core(meta_hi, lons[i], lats[i], alts[i])
-                results[i] = v_lo * w_lo + v_hi * w_hi
-            end
-        end
-        
-        _unpin_nc_cached(p_lo)
-        _unpin_nc_cached(p_hi)
-    end
-    
-    return results
-end
-
-function get_density_trajectory(itp::WAMInterpolator, lon::AbstractVector, lat::AbstractVector, alt::AbstractVector, time::AbstractVector{DateTime})
-    get_density_batch(itp, lon, lat, alt, time)
-end
-
-function get_density_trajectory_optimised(itp::WAMInterpolator, lon::AbstractVector, lat::AbstractVector, alt::AbstractVector, time::AbstractVector{DateTime})
-    get_density_batch(itp, lon, lat, alt, time)
+function __init__()
+    precompile(get_density, (WAMInterpolator, DateTime, Float64, Float64, Float64))
+    precompile(get_density, (GEOSFPInterpolator, DateTime, Float64, Float64, Float64))
+    precompile(get_density, (NRLMSISEInterpolator, DateTime, Float64, Float64, Float64))
+    precompile(get_density, (HybridDensityInterpolator, DateTime, Float64, Float64, Float64))
+    precompile(get_density_batch, (WAMInterpolator, Vector{DateTime}, Vector{Float64}, Vector{Float64}, Vector{Float64}))
+    precompile(_get_density_wam_core, (GridMetadata, Float64, Float64, Float64))
+    precompile(_sciml_quad_logz, (Vector{Float64}, Vector{Float64}, Float64))
 end
 
 end # module
