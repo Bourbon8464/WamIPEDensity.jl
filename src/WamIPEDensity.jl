@@ -741,18 +741,12 @@ Select the cycle hour for the WFS product that should contain `dt`.
 This controls which S3 folder (…/HH/) to search.
 """
 function _wfs_archive(dt::DateTime)::DateTime
-    h = hour(dt)
-    if h < 3
-        return DateTime(Date(dt), Time(0))
-    elseif h < 9
-        return DateTime(Date(dt), Time(6))
-    elseif h < 15
-        return DateTime(Date(dt), Time(12))
-    elseif h < 21
-        return DateTime(Date(dt), Time(18))
-    else
-        return DateTime(Date(dt) + Day(1), Time(0))
-    end
+    # Use the latest cycle at or before `dt` (cycles run 00/06/12/18Z). Each
+    # cycle folder holds stamps from ~3 h before its start through its forecast
+    # horizon, so the flooring cycle always brackets `dt` — and gives the
+    # shortest forecast lead time. (Nearest-cycle rounding picked folders whose
+    # earliest stamp can be after `dt`, e.g. 03:00 is in 00Z, not 06Z.)
+    return DateTime(Date(dt), Time(6 * div(hour(dt), 6)))
 end
 
 """
@@ -1308,12 +1302,12 @@ function _load_grid_metadata(ds::NCDataset, varname::String)
     if idx_z   !== nothing; dim_map[:z]   = idx_z; end
     if idx_time !== nothing; dim_map[:time] = idx_time; end
 
-    return GridMetadata(lon, lat, z, ds, varname, sf, ao, fillvals, dim_map, nd)
+    return GridMetadata(lon, lat, z, ds, varname, sf, ao, fillvals, dim_map, nd, maximum(lon) > 180.0)
 end
 
 
 function _decode_value(val::Float64, meta::GridMetadata)
-    if isnan(val) || ismissing(val) || val in meta.fillvals
+    if isnan(val) || ismissing(val) || val in meta.fill_values
         return NaN
     end
     return val * meta.scale_factor + meta.add_offset
@@ -1868,26 +1862,6 @@ end
 
 # SciML vertical helper (quadratic in log(z) on log(values))
 # Uses DataInterpolations.jl; falls back to linear in log-space or constants if needed.
-function _sciml_quad_logz(z::AbstractVector, v::AbstractVector, zq::Real)
-    # keep only strictly positive, finite pairs (required for log)
-    mask = (z .> 0) .& isfinite.(z) .& (v .> 0) .& isfinite.(v)
-    z_ok = z[mask]; v_ok = v[mask]
-
-    if length(z_ok) == 0
-        return NaN
-    elseif length(z_ok) == 1
-        return v_ok[1]
-    elseif length(z_ok) == 2
-        # linear in log-space between two nearest
-        itp = DataInterpolations.LinearInterpolation(log.(v_ok), log.(z_ok))
-        return exp(itp(log(zq)))
-    else
-        # quadratic in log-space using all available points
-        itp = DataInterpolations.QuadraticSpline(log.(v_ok), log.(z_ok))
-        return exp(itp(log(zq)))
-    end
-end
-
 function _sciml_quad_logz(z::AbstractVector, v::AbstractVector, zq::Real)
     mask = (z .> 0) .& isfinite.(z) .& (v .> 0) .& isfinite.(v)
     z_ok = Float64.(z[mask])
