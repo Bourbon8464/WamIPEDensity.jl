@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.11"
+      - uses: julia-actions/cache@v2
+      - name: Install test dependencies
+        run: julia --project=test -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
+
+      # The offline file is the strict CI gate: it must pass cleanly without
+      # any network access beyond the initial SpaceIndices fetch. If this
+      # step fails, the PR cannot be merged.
+      - name: Run offline test suite (strict)
+        run: julia --project=test -e 'include("test/test_offline.jl")'
+
+      # The full suite is run for visibility. Most WAM-IPE / GEOS-FP
+      # testsets self-skip on a CI runner that is allowed to reach S3 but
+      # might be rate limited or denied - see docs/src/testing.md. We mark
+      # this step `continue-on-error: true` so a self-skipping-but-noisy
+      # testset does not gate the merge.
+      - name: Run full test suite (network-dependent testsets self-skip)
+        run: julia --project=test -e 'include("test/runtests.jl")'
+        continue-on-error: true

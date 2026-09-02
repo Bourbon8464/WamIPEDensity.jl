@@ -19,9 +19,10 @@ import SpaceIndices
 # EXPORTS
 
 export WAMInterpolator, GEOSFPInterpolator, NRLMSISEInterpolator, HybridDensityInterpolator,
+       NRLMSISEOnlyInterpolator, nrlmsise00,
        density, leo_config, lower_atmo_config,
-       get_density, get_density_batch, get_density_at_point, 
-       get_density_trajectory, get_density_trajectory_optimised, mean_density_profile, 
+       get_density, get_density_batch, get_density_at_point,
+       get_density_trajectory, get_density_trajectory_optimised, mean_density_profile,
        plot_global_mean_profile, plot_global_mean_profile_plots,
        prewarm_cache!, set_max_open_datasets!, print_cache_stats, clear_grid_cache!,
        get_density_batch!, clean_cache!,
@@ -105,10 +106,126 @@ Configuration object for the NRLMSISE empirical atmosphere backend. This
 backend is useful as a fallback or as one component of a hybrid density model.
 """
 Base.@kwdef struct NRLMSISEInterpolator
-    interpolation::Symbol = :nearest  
+    interpolation::Symbol = :nearest
     min_alt_km::Float64 = 0.0
     max_alt_km::Float64 = 100.0
     space_indices_initialized::Base.RefValue{Bool} = Ref(false)
+end
+
+"""
+    NRLMSISEOnlyInterpolator(; latitude, longitude, date, solar_flux=135.0,
+                             geomag_index=15.0, min_alt_km=-5.0)
+
+A density interpolator that uses **only** NRLMSISE-00, bypassing WAM-IPE and GEOS-FP.
+Designed for historical dates before the WAM-IPE archive began (2023-03).
+
+# Use cases
+- Historical re-entry simulations (e.g. LOFTID, Nov 10 2022)
+- Testing / offline mode when GTM data is unavailable
+- Environments where only MSIS is needed
+
+# Example
+```julia
+using WamIPEDensity
+model = NRLMSISEOnlyInterpolator(;
+    latitude=45.0,
+    longitude=-120.0,
+    date=DateTime("2022-11-10T12:00:00"),
+    solar_flux=130.0,
+    geomag_index=10.0,
+)
+ρ = get_density(model, 150_000.0, 45.0, -120.0, DateTime("2022-11-10T12:00:00"))
+```
+"""
+mutable struct NRLMSISEOnlyInterpolator <: DensityInterpolator
+    latitude::Float64
+    longitude::Float64
+    date::DateTime
+    solar_flux::Float64
+    geomag_index::Float64
+    min_alt_km::Float64
+end
+
+function NRLMSISEOnlyInterpolator(;
+    latitude::Real,
+    longitude::Real,
+    date::DateTime,
+    solar_flux::Real=135.0,
+    geomag_index::Real=15.0,
+    min_alt_km::Real=-5.0,
+)
+    NRLMSISEOnlyInterpolator(
+        Float64(latitude),
+        Float64(longitude),
+        date,
+        Float64(solar_flux),
+        Float64(geomag_index),
+        Float64(min_alt_km),
+    )
+end
+
+function get_density(interp::NRLMSISEOnlyInterpolator, altitude_m::Real, lat::Real, lon::Real, time::DateTime)
+    alt_km = Float64(altitude_m) / 1000.0
+    alt_km < interp.min_alt_km && return 0.0
+    alt_km = clamp(alt_km, interp.min_alt_km, 1000.0)
+    try
+        ρ = nrlmsise00(alt_km, lat, lon, time, interp.solar_flux, interp.geomag_index)
+        return max(ρ, 0.0)
+    catch e
+        @warn "NRLMSISE-00 density lookup failed" alt_km lat lon exception=e
+        return 0.0
+    end
+end
+
+"""
+    nrlmsise00(alt_km, lat, lon, time, f107, ap)
+
+Compute atmospheric density [kg/m³] using the NRLMSISE-00 empirical model.
+
+# Arguments
+- `alt_km`  — geodetic altitude [km]
+- `lat`     — geodetic latitude [°]
+- `lon`     — geodetic longitude [°]
+- `time`    — DateTime (UTC)
+- `f107`    — F10.7 solar flux [sfu]
+- `ap`      — Ap geomagnetic index
+
+# Returns
+Density [kg/m³] at the given point.
+"""
+function nrlmsise00(alt_km::T, lat::Real, lon::Real, time::DateTime, f107::Real, ap::Real) where T <: AbstractFloat
+    year  = Dates.year(time)
+    doy   = Dates.dayofyear(time)
+    UT_hr = Dates.hour(time) + Dates.minute(time) / 60.0 + Dates.second(time) / 3600.0
+    ap_arr = Float64[ap, 0.0, 0.0]
+    d = zeros(Float64, 9)
+    t = zeros(Float64, 2)
+    ccall(
+        :gtd7_,
+        Nothing,
+        (
+            Ptr{Float64}, Ref{Int32}, Ref{Float64}, Ref{Float64}, Ref{Float64},
+            Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Ptr{Float64},
+            Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Ptr{Float64},
+        ),
+        Ref(T[alt_km]),
+        Ref(Int32(year)),
+        Ref(doy),
+        Ref(UT_hr),
+        Ref(Float64(lon)),
+        Ref(Float64(lat)),
+        Ref(Float64(f107)),
+        Ref(f107),
+        Ref(ap),
+        Ref(ap_arr),
+        Ref(0.0),
+        d, t, 0,
+    )
+    return d[6]
+end
+
+function nrlmsise00(alt_km::Real, lat::Real, lon::Real, time::DateTime, f107::Real, ap::Real)
+    nrlmsise00(Float64(alt_km), lat, lon, time, f107, ap)
 end
 
 
